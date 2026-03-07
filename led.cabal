@@ -1,0 +1,148 @@
+cabal-version:      3.16
+name:               led
+version:            0.1.1.4
+synopsis:           The line editor
+-- homepage:
+description:        A line editor based on an ed implemented in Haskell
+license:            BSD-2-Clause
+license-file:       LICENSE
+author:             Damian Terentev
+maintainer:         noone@madmansnest.com
+copyright:          ©2026, Damian Terentev
+build-type:         Simple
+extra-doc-files:    readme.md
+
+flag release
+    description:    Build with maximum optimisations for release
+    default:        False
+    manual:         True
+
+common shared-properties
+    build-depends:    base ^>=4.22.0.0
+                    , relude
+                    , bytestring
+                    , containers
+                    , directory
+                    , filepath
+                    , hashable
+                    , haskeline >= 0.8
+                    , megaparsec
+                    , optparse-applicative
+                    , process
+                    , text
+                    , text-rope
+                    , transformers
+                    , unix
+                    , vector
+                    , vty
+                    , vty-unix
+
+    mixins:           base hiding (Prelude)
+                    , relude (Relude as Prelude)
+
+    ghc-options:    -Wall
+                    -Wcompat
+                    -Wdefaulted-exception-context
+                    -Widentities
+                    -Wincomplete-record-selectors
+                    -Wincomplete-record-updates
+                    -Wincomplete-uni-patterns
+                    -Winconsistent-flags
+                    -Winvalid-haddock
+                    -Wmissing-deriving-strategies
+                    -Wmissing-export-lists
+                    -Wnoncanonical-monad-instances
+                    -Woperator-whitespace
+                    -Wpartial-fields
+                    -Wredundant-bang-patterns
+                    -Wredundant-constraints
+                    -Wredundant-strictness-flags
+                    -Wterm-variable-capture
+                    -Wview-pattern-signatures
+                    -fhide-source-paths
+                    -fwrite-ide-info
+                    -hiedir=.hie
+
+    default-extensions: LambdaCase
+                      , MultilineStrings
+                      , OverloadedStrings
+
+    default-language: GHC2024
+
+    other-modules:  LedCore
+                    , LedDiff
+                    , LedDocument
+                    , LedEdit
+                    , LedExec
+                    , LedGlobal
+                    , LedIO
+                    , LedInput
+                    , LedManageFiles
+                    , LedNexus
+                    , LedOptions
+                    , LedParse
+                    , LedPrint
+                    , LedReadWrite
+                    , LedRegularExpressions
+                    , LedResolve
+                    , LedRun
+                    , LedSession
+                    , LedSmartReplace
+                    , LedState
+                    , LedUndo
+                    , LedVi
+                    , LedViLine
+                    , LedViMouse
+                    , LedViParse
+                    , LedViRender
+                    , LedViState
+
+    if flag(release)
+      ghc-options:  -fdicts-strict
+                    -fexpose-all-unfoldings
+                    -flate-specialise
+                    -fspec-constr-keen
+                    -fspecialise-aggressively
+
+executable led
+    import:           shared-properties
+    main-is:          Main.hs
+    hs-source-dirs:   src
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+
+test-suite led-spec
+    import:           shared-properties
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   src, spec
+    main-is:          Spec.hs
+    other-modules:    LedCoreSpec
+                    , LedDiffSpec
+                    , LedDocumentSpec
+                    , LedEditSpec
+                    , LedGlobalSpec
+                    , LedInputSpec
+                    , LedIntegrationSpec
+                    , LedIOSpec
+                    , LedManageFilesSpec
+                    , LedNexusSpec
+                    , LedOptionsSpec
+                    , LedParseSpec
+                    , LedPrintSpec
+                    , LedReadWriteSpec
+                    , LedRegularExpressionsSpec
+                    , LedResolveSpec
+                    , LedSessionSpec
+                    , LedSmartReplaceSpec
+                    , LedStateSpec
+                    , LedViLineSpec
+                    , LedViMouseSpec
+                    , LedViParseSpec
+                    , LedViRenderSpec
+
+    build-depends:
+        hspec,
+        hspec-discover,
+        QuickCheck,
+        temporary,
+    build-tool-depends: hspec-discover:hspec-discover
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
