@@ -7,12 +7,13 @@ import qualified Data.Text as T
 
 import LedCore (LedState(..), initialState)
 import LedExec (processInput, readBlockContinuation, readSubContinuation, readBackslashContinuation, evaluatePrompt, importMacroCommand)
-import LedIO (writeDocument, humanisePath)
+import LedIO (writeDocument, expandPath)
 import LedInput (Led, LedEnv(..), HupRef, withLedEnv, runLed, getInputLineLed, handleInterrupt, outputLine)
-import LedNexus (BufferChangeFlag(..), DocumentState(..), insertDocAfter, documentCount, getFilenameAt, getDocStateAt, setDlCurrentDoc, emptyDocumentList)
+import LedNexus (BufferChangeFlag(..), DocumentState(..), insertDocAfter, documentCount, getFilenameAt, getDocStateAt, setDlCurrentDoc, emptyDocumentList, emptyDocumentState)
 import LedOptions (Options(..))
+import LedReadWrite (editFile)
 import LedSession (printHelpIfActive)
-import LedState (ensureNonEmptyDocList, flagError, guardChanged, openDocState, setErrorText)
+import LedState (ensureNonEmptyDocList, flagError, guardChanged, setErrorText)
 import LedUndo (newUndoManager)
 import LedVi (enterVisualMode, VisualModeResult(..))
 import qualified LedDocument
@@ -47,11 +48,14 @@ startup :: Led ()
 startup = do
   modify (\s -> s { ledDocumentList = emptyDocumentList })
   gets ledStartupFiles >>=
-    traverse_ (\path -> do
-      ds <- openDocState path
-      humanPath <- liftIO (humanisePath path)
+    traverse_ (\rawPath -> do
+      path <- liftIO (expandPath rawPath)
       dl <- gets ledDocumentList
-      modify (\s -> s { ledDocumentList = insertDocAfter (documentCount dl) (toText humanPath) ds dl }))
+      let newIdx = documentCount dl + 1
+      -- Insert empty document and make it current
+      modify (\s -> s { ledDocumentList = setDlCurrentDoc newIdx (insertDocAfter (documentCount dl) "" emptyDocumentState dl) })
+      -- Use editFile to load the file (same as 'e' command)
+      editFile path)
   modify (\s -> s { ledDocumentList = setDlCurrentDoc 1 (ledDocumentList s) })
   ensureNonEmptyDocList
   gets ledExecFiles >>= traverse_ importMacroCommand

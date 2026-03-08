@@ -90,6 +90,7 @@ runShellCommand cmd input = readProcessWithExitCode "/bin/sh" ["-c", cmd] input
 -- 4. If still absolute and in home directory, replace home prefix with ~
 -- On any error, returns the original path unchanged.
 humanisePath :: FilePath -> IO FilePath
+humanisePath "" = pure ""
 humanisePath path =
     (expandTildeForCanon path >>= canonicalizePath >>= makeRelativeToCurrentDirectory >>= unexpandTildeIfAbsolute)
       `catch` (\(_ :: SomeException) -> pure path)

@@ -224,7 +224,8 @@ findGlobalCmdlist input = do
 evaluateExpression :: Text -> Led Text
 evaluateExpression expr = do
   oldCapture <- gets ledCaptureOutput
-  modify (\s -> s { ledCaptureOutput = Just [] })
+  oldCmdError <- gets ledCommandError
+  modify (\s -> s { ledCaptureOutput = Just [], ledCommandError = False })
   let lns = T.splitOn "\n" (T.strip expr)
   savedQueue <- gets ledInputQueue
   wasVisual <- gets ledVisualMode
@@ -234,8 +235,10 @@ evaluateExpression expr = do
   -- Preserve queue if visual mode changed (remaining commands for new mode)
   modify (\s -> s { ledInputQueue = if wasVisual == nowVisual then savedQueue else ledInputQueue s })
   captured <- gets ledCaptureOutput
-  modify (\s -> s { ledCaptureOutput = oldCapture })
-  let result = case captured of
+  hadError <- gets ledCommandError
+  modify (\s -> s { ledCaptureOutput = oldCapture, ledCommandError = oldCmdError })
+  -- If error occurred, return empty string (don't substitute error output)
+  let result = if hadError then "" else case captured of
         Just acc -> T.intercalate "\n" (reverse acc)
         Nothing  -> ""
   pure result
@@ -541,11 +544,18 @@ handleParamCommand lineRange cmd = do
       Filename _ Nothing -> outputLine (toString paramName) *> pure True
       Filename _ (Just _) -> paramReject
       _ -> do
-        (result, newParamDs) <- withTempDocument paramName paramDs lineRange cmd
+        -- Transform CrossDocTarget DocParam to LocalTarget since we're already on the param doc
+        let cmd' = localiseParamTargets cmd
+        (result, newParamDs) <- withTempDocument paramName paramDs lineRange cmd'
         modify (\s -> s { ledParamStack = (paramName, newParamDs) : restStack })
         pure result
   where
     paramReject = addressError "Invalid command for parameter document" *> pure True
+    -- Convert CrossDocTarget DocParam to LocalTarget (they refer to the same doc)
+    localiseParamTargets = \case
+      Transfer r (CrossDocTarget DocParam addr) s -> Transfer r (LocalTarget addr) s
+      Move r (CrossDocTarget DocParam addr) s -> Move r (LocalTarget addr) s
+      other -> other
 
 handleDocListCommand :: LineRange -> Command -> Led Bool
 handleDocListCommand lineRange cmd = do

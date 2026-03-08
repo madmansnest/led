@@ -142,12 +142,22 @@ executeMove target srcStart srcEnd = case target of
     moveToParamDoc lineAddr srcStart srcEnd
 
 transferToDocuments :: DocRange -> Addr -> Int -> Int -> Led ()
+transferToDocuments DocParam lineAddr srcStart srcEnd = do
+  -- DocParam target: insert into param stack
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
+  insertIntoParamDoc lineAddr srcLines
+  setCurrentLine srcEnd
 transferToDocuments docRange lineAddr srcStart srcEnd = do
   srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
   withDocRange docRange $ \docIdx ->
     insertIntoDocument docIdx lineAddr srcLines
 
 moveToDocuments :: DocRange -> Addr -> Int -> Int -> Led ()
+moveToDocuments DocParam lineAddr srcStart srcEnd = do
+  -- DocParam target: insert into param stack, then delete source
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
+  insertIntoParamDoc lineAddr srcLines
+  deleteSourceLines srcStart srcEnd
 moveToDocuments docRange lineAddr srcStart srcEnd = do
   srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
   withDocRange docRange $ \docIdx ->

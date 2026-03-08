@@ -135,8 +135,17 @@ pSuffix = option NoSuffix $ choice
 pTargetAddr :: Parser TargetAddr
 pTargetAddr = choice
   [ try (CrossDocTarget <$> pDocRangeWithColon <*> option Current pAddr)
-  , try (ParamTarget <$> (length <$> many (char '^') <* char '@') <*> option Current pAddr)
+  , try (CrossDocTarget <$> pSpecialDocRange <*> option Current pAddr)
+  , try (ParamTarget <$> (length <$> some (char '^') <* char '@') <*> option Current pAddr)
   , LocalTarget <$> pAddr ]
+  where
+    -- Special doc ranges for target addresses (with optional colon)
+    pSpecialDocRange = choice
+      [ DocManage <$ (string "&&" <* optional (char ':'))
+      , DocModified <$ (string "&*" <* optional (char ':'))
+      , DocAll <$ (char '&' <* optional (char ':'))
+      , DocParam <$ (char '@' <* optional (char ':'))
+      ]
 
 pCommand :: Set Text -> Parser Command
 pCommand userFns = do

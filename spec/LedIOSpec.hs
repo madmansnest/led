@@ -149,6 +149,9 @@ spec = describe "LedIO" $ do
       code `shouldBe` ExitFailure 42
 
   describe "humanisePath" $ do
+    it "returns empty string unchanged" $
+      humanisePath "" `shouldReturn` ""
+
     it "makes path relative to current directory" $ withCurrentDirectory "mock" $
       humanisePath "../mock/test.txt" `shouldReturn` "test.txt"
 
