@@ -102,7 +102,7 @@ executeGlobal handlers matchSense lineRange reText cmdlistFirstLine = do
                     Just (BatchDelete suffix) ->
                       executeBatchDelete bre s e marked suffix
                     Just (BatchSubstitute subRe subRepl flags suffix) ->
-                      executeBatchSubstitute bre s e subRe subRepl flags suffix
+                      executeBatchSubstitute s e marked subRe subRepl flags suffix
                     Nothing ->
                       -- Fall back to per-line execution with pre-parsed commands
                       executeOnMarkedLinesParsed handlers parsedCmds marked
@@ -128,7 +128,9 @@ detectBatchPattern _ = Nothing
 executeBatchDelete :: RE.BRE -> Int -> Int -> [Int] -> Suffix -> Led ()
 executeBatchDelete _bre _start _end marked suffix = do
   doc <- getDocument
-  let doc' = LedDocument.deleteLinesBatch marked doc
+  -- Group consecutive lines into ranges and delete from end to start
+  let ranges = groupConsecutive (reverse (sort marked))
+      doc' = foldl' (flip deleteRange) doc ranges
       newTotal = LedDocument.lineCount doc'
       -- New current line: first deleted line position, clamped to valid range
       firstDeleted = minimum marked
@@ -137,15 +139,28 @@ executeBatchDelete _bre _start _end marked suffix = do
   setDocument doc'
   setCurrentLine newCur
   setChangeFlag Changed
-  -- Adjust marks for all deletions (simplified: clear marks in deleted range)
-  -- For proper mark adjustment, we'd need more complex logic
+  -- Adjust marks for all deletions
   forM_ (reverse (sort marked)) $ \lineNum ->
     adjustMarksDelete lineNum lineNum
   printSuffix suffix
+  where
+    -- Delete a range of lines [start, end]
+    deleteRange :: (Int, Int) -> LedDocument.Document -> LedDocument.Document
+    deleteRange (s, e) = LedDocument.replaceLines s (e - s + 1) []
+    -- Group consecutive line numbers into (start, end) ranges
+    -- Input must be sorted in descending order
+    groupConsecutive :: [Int] -> [(Int, Int)]
+    groupConsecutive [] = []
+    groupConsecutive (x:xs) = go x x xs
+      where
+        go s e [] = [(s, e)]
+        go s e (y:ys)
+          | y == s - 1 = go y e ys  -- consecutive
+          | otherwise  = (s, e) : go y y ys
 
--- | Execute batch substitute: substitute in all marked lines in one pass.
-executeBatchSubstitute :: RE.BRE -> Int -> Int -> Text -> Text -> SubstFlags -> Suffix -> Led ()
-executeBatchSubstitute _globalBre start end subRe subRepl flags suffix = do
+-- | Execute batch substitute: substitute in marked lines only in one pass.
+executeBatchSubstitute :: Int -> Int -> [Int] -> Text -> Text -> SubstFlags -> Suffix -> Led ()
+executeBatchSubstitute start end marked subRe subRepl flags suffix = do
   -- Parse the substitute RE (may be empty to reuse last)
   lastRE <- gets ledLastRE
   lastRepl <- gets ledLastReplacement
@@ -163,21 +178,31 @@ executeBatchSubstitute _globalBre start end subRe subRepl flags suffix = do
       doc <- getDocument
       -- Determine if smart replace should be used
       let smartMode = isSmartReplaceEligible subRe actualRepl (sfInsensitive flags)
-          matchFn = if smartMode then RE.matchesBREInsensitive else RE.matchesBRE
-      -- Use mapLinesInRange for single-pass substitution
-      let subFn _lineNum line =
-            if matchFn bre line
-            then let newLine = substituteLine bre actualRepl (sfGlobal flags) (sfCount flags) smartMode line
-                 in Just newLine
-            else Just line  -- Keep unchanged
-      let (doc', lastChanged, anyChanged) = LedDocument.mapLinesInRange start end subFn doc
+          markedSet = Set.fromList marked
+      -- Get lines in range, apply substitution only to marked lines
+      let lns = LedDocument.getLines start end doc
+          (newLines, lastChanged, anyChanged) = mapLinesWithTracking start bre actualRepl flags smartMode markedSet lns
       if not anyChanged
         then addressError "No match"
         else do
+          -- change start to end = replaceLines start (end - start + 1) newLines
+          let doc' = LedDocument.replaceLines start (end - start + 1) newLines doc
           setDocument doc'
           when (lastChanged > 0) $ setCurrentLine lastChanged
           setChangeFlag Changed
           printSuffix suffix
+  where
+    -- Map over lines, applying substitution only to marked lines and tracking changes
+    mapLinesWithTracking :: Int -> RE.BRE -> Text -> SubstFlags -> Bool -> Set.Set Int -> [Text] -> ([Text], Int, Bool)
+    mapLinesWithTracking startLine bre repl flgs smartMode markedSet lns = go lns startLine [] 0 False
+      where
+        go [] _ acc lastCh changed = (reverse acc, lastCh, changed)
+        go (l:ls) lineNum acc lastCh changed =
+          if lineNum `Set.member` markedSet
+          then let newLine = substituteLine bre repl (sfGlobal flgs) (sfCount flgs) smartMode l
+                   didChange = newLine /= l
+               in go ls (lineNum + 1) (newLine : acc) (if didChange then lineNum else lastCh) (changed || didChange)
+          else go ls (lineNum + 1) (l : acc) lastCh changed
 
 -- | Read continuation lines for a global command list.
 -- If the first line ends with \, read more lines until one doesn't.

@@ -31,7 +31,7 @@ module LedNexus
 
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
-import LedDocument (Document, emptyDocument, documentLines, fromLines, appendAfter, deleteLines, lineCount)
+import LedDocument (Document, emptyDocument, documentLines, fromLines, replaceLines, lineCount)
 import LedParse (Addr(..))
 import LedResolve (resolveAddr)
 
@@ -98,7 +98,8 @@ setDocStateAt idx ds dl
 insertDocAfter :: Int -> Text -> DocumentState -> DocumentList -> DocumentList
 insertDocAfter pos filename ds dl =
   let oldDlState = dlDocListState dl
-      newDlDoc = appendAfter pos [filename] (docDocument oldDlState)
+      -- append after pos = replaceLines (pos + 1) 0 lines
+      newDlDoc = replaceLines (pos + 1) 0 [filename] (docDocument oldDlState)
       (before, after) = Seq.splitAt pos (dlDocuments dl)
       newDocuments = before <> Seq.singleton ds <> after
   in dl { dlDocListState = oldDlState { docDocument = newDlDoc }, dlDocuments = newDocuments }
@@ -111,9 +112,10 @@ deleteDocRange start end dl
   | otherwise =
       let oldDlState = dlDocListState dl
           curDoc = docCurrentLine oldDlState
-          newDlDoc = deleteLines start end (docDocument oldDlState)
           count = documentCount dl
           actualEnd = min end count
+          -- delete s to e = replaceLines s (e - s + 1) []
+          newDlDoc = replaceLines start (actualEnd - start + 1) [] (docDocument oldDlState)
           (before, rest) = Seq.splitAt (start - 1) (dlDocuments dl)
           after = Seq.drop ((actualEnd - start + 1)) rest
           newDocuments = before <> after
@@ -240,7 +242,8 @@ insertLinesInDocStateAt :: Int -> [Text] -> DocumentState -> DocumentState
 insertLinesInDocStateAt dest srcLines ds =
   let doc = docDocument ds
       count = length srcLines
-      doc' = appendAfter dest srcLines doc
+      -- append after dest = replaceLines (dest + 1) 0 lines
+      doc' = replaceLines (dest + 1) 0 srcLines doc
       newLine = dest + count
       marks' = adjustMarksForInsert dest count (docMarks ds)
   in ds { docDocument = doc'

@@ -6,7 +6,7 @@ import Test.QuickCheck
 
 import qualified Data.Text as T
 
-import LedDocument (emptyDocument, fromText, fromLines, documentText, documentLines, appendAfter, deleteLines, getLines, joinLines, lineCount)
+import LedDocument (emptyDocument, fromText, fromLines, documentText, documentLines, replaceLines, getLines, lineCount)
 
 spec :: Spec
 spec = describe "LedDocument" $ do
@@ -56,55 +56,56 @@ spec = describe "LedDocument" $ do
           doc = fromLines ls
       in documentLines doc === ls
 
-  describe "appendAfter" $ do
+  describe "replaceLines" $ do
+    -- append after n = replaceLines (n + 1) 0 newLines
     it "inserts after line 0 (prepend)" $
       let doc = fromText "a\nb\n"
-          doc' = appendAfter 0 ["x"] doc
+          doc' = replaceLines 1 0 ["x"] doc
       in documentLines doc' `shouldBe` ["x", "a", "b"]
 
     it "inserts after last line (append)" $
       let doc = fromText "a\nb\n"
-          doc' = appendAfter 2 ["x"] doc
+          doc' = replaceLines 3 0 ["x"] doc
       in documentLines doc' `shouldBe` ["a", "b", "x"]
 
     it "inserts in the middle" $
       let doc = fromText "a\nb\nc\n"
-          doc' = appendAfter 1 ["x", "y"] doc
+          doc' = replaceLines 2 0 ["x", "y"] doc
       in documentLines doc' `shouldBe` ["a", "x", "y", "b", "c"]
 
     it "inserts into empty document" $
-      let doc' = appendAfter 0 ["hello"] emptyDocument
+      let doc' = replaceLines 1 0 ["hello"] emptyDocument
       in documentLines doc' `shouldBe` ["hello"]
 
     it "inserts multiple lines" $
       let doc = fromText "a\n"
-          doc' = appendAfter 1 ["b", "c", "d"] doc
+          doc' = replaceLines 2 0 ["b", "c", "d"] doc
       in documentLines doc' `shouldBe` ["a", "b", "c", "d"]
 
-  describe "deleteLines" $ do
+    -- delete s to e = replaceLines s (e - s + 1) []
     it "deletes a single line" $
       let doc = fromText "a\nb\nc\n"
-          doc' = deleteLines 2 2 doc
+          doc' = replaceLines 2 1 [] doc
       in documentLines doc' `shouldBe` ["a", "c"]
 
     it "deletes first line" $
       let doc = fromText "a\nb\nc\n"
-          doc' = deleteLines 1 1 doc
+          doc' = replaceLines 1 1 [] doc
       in documentLines doc' `shouldBe` ["b", "c"]
 
     it "deletes last line" $
       let doc = fromText "a\nb\nc\n"
-          doc' = deleteLines 3 3 doc
+          doc' = replaceLines 3 1 [] doc
       in documentLines doc' `shouldBe` ["a", "b"]
 
     it "deletes a range of lines" $
       let doc = fromText "a\nb\nc\nd\n"
-          doc' = deleteLines 2 3 doc
+          doc' = replaceLines 2 2 [] doc
       in documentLines doc' `shouldBe` ["a", "d"]
 
     it "deletes all lines" $
       let doc = fromText "a\nb\n"
-          doc' = deleteLines 1 2 doc
+          doc' = replaceLines 1 2 [] doc
       in documentLines doc' `shouldBe` []
 
   describe "getLines" $ do
@@ -128,33 +129,39 @@ spec = describe "LedDocument" $ do
       let doc = fromText "a\nb\nc\n"
       in getLines 3 3 doc `shouldBe` ["c"]
 
-  describe "joinLines" $ do
+  describe "replaceLines (join pattern)" $ do
+    -- join s to e = replaceLines s (e - s + 1) [T.concat (getLines s e doc)]
+    let joinLines' s e doc =
+          let lns = getLines s e doc
+              joined = T.concat lns
+          in replaceLines s (e - s + 1) [joined] doc
+
     it "joins two adjacent lines" $
       let doc = fromText "a\nb\nc\n"
-          doc' = joinLines 1 2 doc
+          doc' = joinLines' 1 2 doc
       in documentLines doc' `shouldBe` ["ab", "c"]
 
     it "joins three lines" $
       let doc = fromText "a\nb\nc\nd\n"
-          doc' = joinLines 1 3 doc
+          doc' = joinLines' 1 3 doc
       in documentLines doc' `shouldBe` ["abc", "d"]
 
     it "joins all lines" $
       let doc = fromText "a\nb\nc\n"
-          doc' = joinLines 1 3 doc
+          doc' = joinLines' 1 3 doc
       in documentLines doc' `shouldBe` ["abc"]
 
     it "joins a single line (no-op)" $
       let doc = fromText "a\nb\nc\n"
-          doc' = joinLines 2 2 doc
+          doc' = joinLines' 2 2 doc
       in documentLines doc' `shouldBe` ["a", "b", "c"]
 
     it "joins middle lines" $
       let doc = fromText "a\nb\nc\nd\ne\n"
-          doc' = joinLines 2 4 doc
+          doc' = joinLines' 2 4 doc
       in documentLines doc' `shouldBe` ["a", "bcd", "e"]
 
     it "preserves line count correctly" $
       let doc = fromText "a\nb\nc\nd\n"
-          doc' = joinLines 2 3 doc
+          doc' = joinLines' 2 3 doc
       in lineCount doc' `shouldBe` 3

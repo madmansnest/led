@@ -310,6 +310,14 @@ spec = describe "Integration" $ do
       code `shouldBe` ExitSuccess
       out `shouldBe` "xxx bar\nxxx baz\n"
 
+    it "g/pattern/s/^/prefix/ only affects matching lines" $ withTempInput "apple\nbanana\napricot\ncherry\n" $ \args -> do
+      -- g/ap/s/^/FRUIT: / should only prefix lines containing "ap", not all lines
+      -- This tests that batch substitute optimization respects the global pattern
+      (code, out, _) <- runLed ("-s" : args) "g/ap/s/^/FRUIT: /\n,p\nQ\n"
+      code `shouldBe` ExitSuccess
+      -- Only "apple" and "apricot" should be prefixed
+      out `shouldBe` "FRUIT: apple\nbanana\nFRUIT: apricot\ncherry\n"
+
     it "G/RE/ sets previous RE for subsequent s//" $ withTempInput "foo one\nbar two\nfoo three\n" $ \args -> do
       -- G/foo/ interactively visits lines with "foo", setting last RE to "foo"
       -- Then we can use s// on those lines

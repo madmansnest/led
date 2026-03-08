@@ -227,9 +227,12 @@ evaluateExpression expr = do
   modify (\s -> s { ledCaptureOutput = Just [] })
   let lns = T.splitOn "\n" (T.strip expr)
   savedQueue <- gets ledInputQueue
+  wasVisual <- gets ledVisualMode
   modify (\s -> s { ledInputQueue = lns })
   void processFunctionQueueDirect
-  modify (\s -> s { ledInputQueue = savedQueue })
+  nowVisual <- gets ledVisualMode
+  -- Preserve queue if visual mode changed (remaining commands for new mode)
+  modify (\s -> s { ledInputQueue = if wasVisual == nowVisual then savedQueue else ledInputQueue s })
   captured <- gets ledCaptureOutput
   modify (\s -> s { ledCaptureOutput = oldCapture })
   let result = case captured of
@@ -420,7 +423,11 @@ executeCommand = \case
       pure True
     Comment -> pure True
     ImportDir -> importDirCommand *> pure True
-    ImportMacro path -> importMacroCommand path *> pure True
+    ImportMacro path -> do
+      wasVisual <- gets ledVisualMode
+      importMacroCommand path
+      nowVisual <- gets ledVisualMode
+      pure (wasVisual == nowVisual)
 
     -- Function commands
     FnList -> defineFunctionCommand "" [] Nothing *> pure True
@@ -433,9 +440,14 @@ executeCommand = \case
         Just (_, body) -> do
           let rangeText = formatLineRange (frLines range)
               allArgs = if T.null rangeText then args else rangeText : args
-          void $ invokeFunctionWithParams name body allArgs
-          printSuffix suf
-          pure True
+          wasVisual <- gets ledVisualMode
+          _ <- invokeFunctionWithParams name body allArgs
+          nowVisual <- gets ledVisualMode
+          -- If visual mode changed during function execution, stop processing
+          -- to let mainLoop handle the mode transition
+          if wasVisual /= nowVisual
+            then pure False
+            else printSuffix suf *> pure True
 
 formatLineRange :: LineRange -> Text
 formatLineRange = \case

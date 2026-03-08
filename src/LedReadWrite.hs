@@ -76,11 +76,11 @@ filterLines start end rawCmd = resolveShellExpansion rawCmd >>= \case
       (_, out, err) <- liftIO $ runShellCommand (toString cmd2) (toString input)
       unless (null err) $ outputStrLn' err
       let outLines = if null out then [] else T.lines (toText out)
-          doc1 = LedDocument.deleteLines start end doc
-          doc2 = LedDocument.appendAfter (start - 1) outLines doc1
+          -- change s to e = replaceLines s (e - s + 1) newLines
+          doc' = LedDocument.replaceLines start (end - start + 1) outLines doc
           newCur = if null outLines then (if start > 1 then start - 1 else 0)
                    else start + length outLines - 1
-      setDocument doc2
+      setDocument doc'
       setCurrentLine newCur
       setChangeFlag Changed
       adjustMarksDelete start end
@@ -101,7 +101,8 @@ readFileCommand path addr = do
             let lns = LedDocument.documentLines newDoc
             unless (null lns) $ do
               doc <- getDocument
-              let doc' = LedDocument.appendAfter addr lns doc
+              -- append after addr = replaceLines (addr + 1) 0 lines
+              let doc' = LedDocument.replaceLines (addr + 1) 0 lns doc
                   newLine = addr + length lns
               setDocument doc'
               setCurrentLine newLine
@@ -121,7 +122,8 @@ readShellCommand cmd addr = do
         lns = if T.null t then [] else T.lines t
     unless (null lns) $ do
       doc <- getDocument
-      let doc' = LedDocument.appendAfter addr lns doc
+      -- append after addr = replaceLines (addr + 1) 0 lines
+      let doc' = LedDocument.replaceLines (addr + 1) 0 lns doc
           newLine = addr + length lns
       setDocument doc'
       setCurrentLine newLine

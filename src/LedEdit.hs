@@ -22,108 +22,111 @@ import LedState
 import qualified LedDocument
 import qualified LedRegularExpressions as RE
 
+commitChange :: LedDocument.Document -> Int -> Led ()
+commitChange doc newLine = do
+  setDocument doc
+  setCurrentLine newLine
+  setChangeFlag Changed
+
+withValidRange :: Int -> Int -> Led () -> Led ()
+withValidRange start end action
+  | start == 0 || end == 0 = addressError "Invalid address"
+  | otherwise = action
+
+withDocRange :: DocRange -> (Int -> Led ()) -> Led ()
+withDocRange docRange action = do
+  dl <- gets ledDocumentList
+  let curDoc = dlCurrentDoc dl
+      total = documentCount dl
+      docFilenames = LedDocument.documentLines (dlDocList dl)
+      dlMarks = docMarks (dlDocListState dl)
+  case resolveDocRange curDoc total docFilenames dlMarks docRange of
+    Left err -> addressError err
+    Right (docStart, docEnd) -> forM_ [docStart..docEnd] action
+
 appendLinesAt :: Int -> [Text] -> Led ()
 appendLinesAt _ [] = pure ()
 appendLinesAt addr ls = do
   doc <- getDocument
-  let doc' = LedDocument.appendAfter addr ls doc
-      newLine = addr + length ls
-  setDocument doc'
-  setCurrentLine newLine
-  setChangeFlag Changed
+  let doc' = LedDocument.replaceLines (addr + 1) 0 ls doc
+  commitChange doc' (addr + length ls)
   adjustMarksInsert addr (length ls)
 
 insertLinesAt :: Int -> [Text] -> Led ()
 insertLinesAt _ [] = pure ()
 insertLinesAt addr ls = do
-  let insertAt = if addr == 0 then 0 else addr - 1
+  let pos = max 1 addr
   doc <- getDocument
-  let doc' = LedDocument.appendAfter insertAt ls doc
-      newLine = insertAt + length ls
-  setDocument doc'
-  setCurrentLine newLine
-  setChangeFlag Changed
-  adjustMarksInsert insertAt (length ls)
+  let doc' = LedDocument.replaceLines pos 0 ls doc
+  commitChange doc' (pos + length ls - 1)
+  adjustMarksInsert (pos - 1) (length ls)
 
 changeLinesWithText :: Maybe Text -> Int -> Int -> Led ()
-changeLinesWithText inlineTxt start end
-    | start == 0 || end == 0 = addressError "Invalid address"
-    | otherwise = do
-        inputLines <- maybe readInputText (pure . (: [])) inlineTxt
-        doc <- getDocument
-        let doc1 = LedDocument.deleteLines start end doc
-            doc2 = LedDocument.appendAfter (start - 1) inputLines doc1
-            total = LedDocument.lineCount doc2
-            newLine
-              | not (null inputLines) = start + length inputLines - 1
-              | start - 1 > 0 && start - 1 <= total = start - 1
-              | total > 0 = total
-              | otherwise = 0
-        setDocument doc2
-        setCurrentLine newLine
-        setChangeFlag Changed
-        adjustMarksDelete start end
-        unless (null inputLines) $ adjustMarksInsert (start - 1) (length inputLines)
+changeLinesWithText inlineTxt start end = withValidRange start end $ do
+  inputLines <- maybe readInputText (pure . (: [])) inlineTxt
+  doc <- getDocument
+  let doc' = LedDocument.replaceLines start (end - start + 1) inputLines doc
+      total = LedDocument.lineCount doc'
+      newLine
+        | not (null inputLines) = start + length inputLines - 1
+        | start - 1 > 0 && start - 1 <= total = start - 1
+        | total > 0 = total
+        | otherwise = 0
+  commitChange doc' newLine
+  adjustMarksDelete start end
+  unless (null inputLines) $ adjustMarksInsert (start - 1) (length inputLines)
 
 deleteLines :: Int -> Int -> Led ()
-deleteLines start end
-    | start == 0 || end == 0 = addressError "Invalid address"
-    | otherwise = do
-        doc <- getDocument
-        let doc' = LedDocument.deleteLines start end doc
-            total = LedDocument.lineCount doc'
-            newLine | start > total = total
-                    | otherwise     = start
-        setDocument doc'
-        setCurrentLine newLine
-        setChangeFlag Changed
-        adjustMarksDelete start end
+deleteLines start end = withValidRange start end $ do
+  doc <- getDocument
+  let doc' = LedDocument.replaceLines start (end - start + 1) [] doc
+      total = LedDocument.lineCount doc'
+  commitChange doc' (min start total)
+  adjustMarksDelete start end
 
 joinLines :: Int -> Int -> Led ()
-joinLines start end
-    | start == 0 || end == 0 = addressError "Invalid address"
-    | otherwise = do
-        doc <- getDocument
-        let doc' = LedDocument.joinLines start end doc
-        setDocument doc'
-        setCurrentLine start
-        setChangeFlag Changed
-        when (end > start) $ adjustMarksDelete (start + 1) end
+joinLines start end = withValidRange start end $
+  when (start < end) $ do
+    doc <- getDocument
+    let lns = LedDocument.getLines start end doc
+        doc' = LedDocument.replaceLines start (end - start + 1) [T.concat lns] doc
+    commitChange doc' start
+    adjustMarksDelete (start + 1) end
 
 transferLines :: Int -> Int -> Int -> Led ()
 transferLines start end dest = do
   doc <- getDocument
   let srcLines = LedDocument.getLines start end doc
-      count = length srcLines
-      doc' = LedDocument.appendAfter dest srcLines doc
-      newLine = dest + count
-  setDocument doc'
-  setCurrentLine newLine
-  setChangeFlag Changed
-  adjustMarksInsert dest count
+      doc' = LedDocument.replaceLines (dest + 1) 0 srcLines doc
+  commitChange doc' (dest + length srcLines)
+  adjustMarksInsert dest (length srcLines)
 
 moveLines :: Int -> Int -> Int -> Led ()
 moveLines start end dest
-    | dest >= start && dest <= end = addressError "Invalid address"
-    | otherwise = do
-        doc <- getDocument
-        let srcLines = LedDocument.getLines start end doc
-            count = end - start + 1
-            adjDest | dest > end = dest - count
-                    | otherwise  = dest
-            doc1 = LedDocument.deleteLines start end doc
-            doc2 = LedDocument.appendAfter adjDest srcLines doc1
-            newLine = adjDest + length srcLines
-        setDocument doc2
-        setCurrentLine newLine
-        setChangeFlag Changed
-        adjustMarksDelete start end
-        adjustMarksInsert adjDest count
+  | dest >= start && dest <= end = addressError "Invalid address"
+  | otherwise = do
+      doc <- getDocument
+      let srcLines = LedDocument.getLines start end doc
+          count = end - start + 1
+          adjDest = if dest > end then dest - count else dest
+          doc' = LedDocument.replaceLines (adjDest + 1) 0 srcLines
+               $ LedDocument.replaceLines start count [] doc
+      commitChange doc' (adjDest + length srcLines)
+      adjustMarksDelete start end
+      adjustMarksInsert adjDest count
+
+deleteSourceLines :: Int -> Int -> Led ()
+deleteSourceLines start end = do
+  doc <- getDocument
+  let doc' = LedDocument.replaceLines start (end - start + 1) [] doc
+      total = LedDocument.lineCount doc'
+  commitChange doc' (min start total)
+  adjustMarksDelete start end
 
 executeTransfer :: TargetAddr -> Int -> Int -> Led ()
 executeTransfer target srcStart srcEnd = case target of
   LocalTarget addr ->
-    resolveTargetAddress addr >>= maybe (pure ()) (transferLines srcStart srcEnd)
+    resolveTargetAddress addr >>= traverse_ (transferLines srcStart srcEnd)
   CrossDocTarget docRange lineAddr ->
     transferToDocuments docRange lineAddr srcStart srcEnd
   ParamTarget _depth lineAddr ->
@@ -132,7 +135,7 @@ executeTransfer target srcStart srcEnd = case target of
 executeMove :: TargetAddr -> Int -> Int -> Led ()
 executeMove target srcStart srcEnd = case target of
   LocalTarget addr ->
-    resolveTargetAddress addr >>= maybe (pure ()) (moveLines srcStart srcEnd)
+    resolveTargetAddress addr >>= traverse_ (moveLines srcStart srcEnd)
   CrossDocTarget docRange lineAddr ->
     moveToDocuments docRange lineAddr srcStart srcEnd
   ParamTarget _depth lineAddr ->
@@ -140,46 +143,16 @@ executeMove target srcStart srcEnd = case target of
 
 transferToDocuments :: DocRange -> Addr -> Int -> Int -> Led ()
 transferToDocuments docRange lineAddr srcStart srcEnd = do
-  doc <- getDocument
-  let srcLines = LedDocument.getLines srcStart srcEnd doc
-  dl <- gets ledDocumentList
-  let curDoc = dlCurrentDoc dl
-      total = documentCount dl
-      docFilenames = LedDocument.documentLines (dlDocList dl)
-      dlMarks = docMarks (dlDocListState dl)
-  case resolveDocRange curDoc total docFilenames dlMarks docRange of
-    Left err -> addressError err
-    Right (docStart, docEnd) ->
-      forM_ [docStart..docEnd] $ \docIdx ->
-        insertIntoDocument docIdx lineAddr srcLines
-
-deleteSourceLines :: Int -> Int -> Led ()
-deleteSourceLines srcStart srcEnd = do
-  doc <- getDocument
-  let doc' = LedDocument.deleteLines srcStart srcEnd doc
-      newTotal = LedDocument.lineCount doc'
-      newLine | srcStart > newTotal = newTotal
-              | otherwise           = srcStart
-  setDocument doc'
-  setCurrentLine newLine
-  setChangeFlag Changed
-  adjustMarksDelete srcStart srcEnd
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
+  withDocRange docRange $ \docIdx ->
+    insertIntoDocument docIdx lineAddr srcLines
 
 moveToDocuments :: DocRange -> Addr -> Int -> Int -> Led ()
 moveToDocuments docRange lineAddr srcStart srcEnd = do
-  doc <- getDocument
-  let srcLines = LedDocument.getLines srcStart srcEnd doc
-  dl <- gets ledDocumentList
-  let curDoc = dlCurrentDoc dl
-      total = documentCount dl
-      docFilenames = LedDocument.documentLines (dlDocList dl)
-      dlMarks = docMarks (dlDocListState dl)
-  case resolveDocRange curDoc total docFilenames dlMarks docRange of
-    Left err -> addressError err
-    Right (docStart, docEnd) -> do
-      forM_ [docStart..docEnd] $ \docIdx ->
-        insertIntoDocument docIdx lineAddr srcLines
-      deleteSourceLines srcStart srcEnd
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
+  withDocRange docRange $ \docIdx ->
+    insertIntoDocument docIdx lineAddr srcLines
+  deleteSourceLines srcStart srcEnd
 
 insertIntoDocument :: Int -> Addr -> [Text] -> Led ()
 insertIntoDocument docIdx lineAddr srcLines = do
@@ -188,36 +161,32 @@ insertIntoDocument docIdx lineAddr srcLines = do
     Nothing -> addressError "Invalid document"
     Just ds -> case insertLinesIntoDocState lineAddr srcLines ds of
       Left err -> addressError err
-      Right ds' -> modify (\s -> s { ledDocumentList = setDocStateAt docIdx ds' (ledDocumentList s) })
+      Right ds' -> modify $ \s ->
+        s { ledDocumentList = setDocStateAt docIdx ds' (ledDocumentList s) }
 
 executeCrossDocTransfer :: Int -> Addr -> Int -> Int -> Led ()
 executeCrossDocTransfer origDoc addr srcStart srcEnd = do
-  doc <- getDocument
-  let srcLines = LedDocument.getLines srcStart srcEnd doc
-  dl <- gets ledDocumentList
-  case getDocStateAt origDoc dl of
-    Nothing -> addressError "Invalid document"
-    Just ds -> case insertLinesIntoDocState addr srcLines ds of
-      Left err -> addressError err
-      Right ds' -> modify (\s -> s { ledDocumentList = setDocStateAt origDoc ds' (ledDocumentList s) })
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
+  insertIntoDocument origDoc addr srcLines
 
 executeCrossDocMove :: Int -> Addr -> Int -> Int -> Led ()
 executeCrossDocMove origDoc addr srcStart srcEnd = do
   executeCrossDocTransfer origDoc addr srcStart srcEnd
-  hasError <- gets ledCommandError
-  unless hasError $ deleteSourceLines srcStart srcEnd
+  unlessError $ deleteSourceLines srcStart srcEnd
+  where
+    unlessError action = do
+      hasError <- gets ledCommandError
+      unless hasError action
 
 transferToParamDoc :: Addr -> Int -> Int -> Led ()
 transferToParamDoc lineAddr srcStart srcEnd = do
-  doc <- getDocument
-  let srcLines = LedDocument.getLines srcStart srcEnd doc
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
   insertIntoParamDoc lineAddr srcLines
   setCurrentLine srcEnd
 
 moveToParamDoc :: Addr -> Int -> Int -> Led ()
 moveToParamDoc lineAddr srcStart srcEnd = do
-  doc <- getDocument
-  let srcLines = LedDocument.getLines srcStart srcEnd doc
+  srcLines <- LedDocument.getLines srcStart srcEnd <$> getDocument
   insertIntoParamDoc lineAddr srcLines
   deleteSourceLines srcStart srcEnd
 
@@ -228,37 +197,33 @@ insertIntoParamDoc lineAddr srcLines = do
     [] -> addressError "No parameter document"
     ((name, ds):rest) -> case insertLinesIntoDocState lineAddr srcLines ds of
       Left err -> addressError err
-      Right ds' -> modify (\s -> s { ledParamStack = (name, ds') : rest })
+      Right ds' -> modify $ \s -> s { ledParamStack = (name, ds') : rest }
 
 substituteCommand :: Text -> Text -> SubstFlags -> Int -> Int -> Led ()
 substituteCommand reText repl' flags start end = do
-    lastRE <- gets ledLastRE
-    lastRepl <- gets ledLastReplacement
-    let mbre = if T.null reText
-               then maybe (Left "No previous regular expression") Right lastRE
-               else RE.parseBRE reText
-        mrepl = if repl' == "%"
-                then maybe (Left "No previous substitution") Right lastRepl
-                else Right repl'
-    case (mbre, mrepl) of
-      (Left err, _) -> addressError err
-      (_, Left err) -> addressError err
-      (Right bre, Right actualRepl) -> do
-        modify (\s -> s { ledLastRE = Just bre, ledLastReplacement = Just actualRepl })
-        doc <- getDocument
-        let lns = LedDocument.getLines start end doc
-            -- Determine if smart replace should be used
-            smartMode = isSmartReplaceEligible reText actualRepl (sfInsensitive flags)
-            (anyChanged, newLines, lastChanged) =
-              substituteLinesLoop bre actualRepl (sfGlobal flags) (sfCount flags) smartMode start lns
-        if not anyChanged
-          then addressError "No match"
-          else do
-            let doc1 = LedDocument.deleteLines start end doc
-                doc2 = LedDocument.appendAfter (start - 1) newLines doc1
-            setDocument doc2
-            setCurrentLine lastChanged
-            setChangeFlag Changed
+  lastRE <- gets ledLastRE
+  lastRepl <- gets ledLastReplacement
+  let mbre = if T.null reText
+             then maybe (Left "No previous regular expression") Right lastRE
+             else RE.parseBRE reText
+      mrepl = if repl' == "%"
+              then maybe (Left "No previous substitution") Right lastRepl
+              else Right repl'
+  case (mbre, mrepl) of
+    (Left err, _) -> addressError err
+    (_, Left err) -> addressError err
+    (Right bre, Right actualRepl) -> do
+      modify $ \s -> s { ledLastRE = Just bre, ledLastReplacement = Just actualRepl }
+      doc <- getDocument
+      let lns = LedDocument.getLines start end doc
+          smartMode = isSmartReplaceEligible reText actualRepl (sfInsensitive flags)
+          (anyChanged, newLines, lastChanged) =
+            substituteLinesLoop bre actualRepl (sfGlobal flags) (sfCount flags) smartMode start lns
+      if not anyChanged
+        then addressError "No match"
+        else do
+          let doc' = LedDocument.replaceLines start (end - start + 1) newLines doc
+          commitChange doc' lastChanged
 
 substituteLine :: RE.BRE -> Text -> Bool -> Int -> Bool -> Text -> Text
 substituteLine bre rpl isGlobal cnt smartMode line

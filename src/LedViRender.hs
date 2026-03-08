@@ -15,11 +15,9 @@ module LedViRender
   , showCommandRange
   , showEmptyDisplay
 
-  -- Soft wrapping
   , wrapDisplayZone
   , gutterWidth
 
-  -- Unified edit preview
   , EditMode(..)
   , showEditPreview
 
@@ -36,6 +34,7 @@ module LedViRender
   ) where
 
 import qualified Data.IntMap.Strict as IM
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Graphics.Vty as Vty
@@ -51,7 +50,6 @@ import LedViState
 
 
 -- Color Scheme
-
 displayZoneBg :: Vty.Color
 displayZoneBg = Vty.ISOColor 234
 
@@ -100,8 +98,31 @@ inputAttr :: Vty.Attr
 inputAttr = Vty.defAttr
 
 
--- Unified Edit Preview
--- All edit previews (delete/append/insert/change/move/transfer) use this system
+withDocState :: Int -> DocumentList -> Int -> Int -> (DocumentState -> DisplayZone) -> DisplayZone
+withDocState docIdx dl width height f =
+  case getDocStateAt docIdx dl of
+    Nothing -> emptyDisplayZone width height
+    Just ds -> f ds
+
+docInfo :: DocumentState -> (Int, Int, [Text], Map.Map Char Int)
+docInfo ds = (docCurrentLine ds, lineCount (docDocument ds), documentLines (docDocument ds), docMarks ds)
+
+resolveRange :: Int -> Int -> Map.Map Char Int -> [Text] -> LineRange -> (Int -> Int -> (Int, Int)) -> (Int, Int)
+resolveRange curLine total marks allLines lineRange defaultFn =
+  case lineRange of
+    LineDefault -> defaultFn curLine total
+    _ -> case resolveLineRange curLine total marks allLines lineRange of
+      Left _  -> defaultFn curLine total
+      Right r -> r
+
+mkDisplayZone :: [DisplayLine] -> Int -> Int -> Int -> Maybe (Int, Int) -> DisplayZone
+mkDisplayZone lines' scrollTop width height targetRange = DisplayZone
+  { dzLines = V.fromList lines'
+  , dzScrollTop = scrollTop
+  , dzHeight = height
+  , dzWidth = width
+  , dzTargetRange = targetRange
+  }
 
 data EditMode
   = EditDelete                    -- ^ Delete: show lines as deleted
@@ -110,38 +131,19 @@ data EditMode
   | EditChange ![Text]            -- ^ Change: show deleted + insert new lines
   | EditMove !Int ![Text]         -- ^ Move: delete source, insert at target position
   | EditTransfer !Int ![Text]     -- ^ Transfer: copy lines to target position
+  | EditJoin                      -- ^ Join: show lines to be joined, preview result
   deriving stock (Eq, Show)
 
--- Handles all edit command previews with a single code path.
 showEditPreview :: EditMode -> DocRange -> LineRange -> DocumentList -> ParamStack -> Int -> Int -> DisplayZone
 showEditPreview mode docRange lineRange dl paramStack width height =
   case docRange of
     DocDefault ->
       let curDoc = dlCurrentDoc dl
-      in case getDocStateAt curDoc dl of
-        Nothing -> emptyDisplayZone width height
-        Just docState ->
-          let doc = docDocument docState
-              curLine = docCurrentLine docState
-              totalLines = lineCount doc
-              allLines = documentLines doc
-              marks = docMarks docState
-              -- Resolve the line range
-              (rangeStart, rangeEnd) = case lineRange of
-                LineDefault -> defaultRangeCurrent curLine totalLines
-                _ -> case resolveLineRange curLine totalLines marks allLines lineRange of
-                  Left _ -> defaultRangeCurrent curLine totalLines
-                  Right r -> r
-              -- Build display based on edit mode
-              (displayLines, targetStart, targetEnd) = buildEditDisplay mode curDoc rangeStart rangeEnd allLines
-              scrollTop = scrollToShowRange targetStart targetEnd (length displayLines) height
-          in DisplayZone
-            { dzLines = V.fromList displayLines
-            , dzScrollTop = scrollTop
-            , dzHeight = height
-            , dzWidth = width
-            , dzTargetRange = Just (targetStart, targetEnd)
-            }
+      in withDocState curDoc dl width height $ \docState ->
+        let (curLine, _, allLines, marks) = docInfo docState
+            (rangeStart, rangeEnd) = resolveRange curLine (length allLines) marks allLines lineRange defaultRangeCurrent
+            (displayLines, targetStart, targetEnd) = buildEditDisplay mode curDoc rangeStart rangeEnd allLines
+        in mkDisplayZone displayLines (scrollToShowRange targetStart targetEnd (length displayLines) height) width height (Just (targetStart, targetEnd))
     _ ->
       showResolvedRangeWithDefault docRange lineRange defaultRangeCurrent dl paramStack width height
 
@@ -169,7 +171,6 @@ buildEditDisplay mode docIdx rangeStart rangeEnd allLines =
         } | txt <- txts ]
 
   in case mode of
-       -- Delete: mark range as deleted
        EditDelete ->
          let dispLines = [mkLine i (if i >= rangeStart && i <= rangeEnd then StyleDeleted else StyleNormal)
                          | i <- [1..totalLines]]
@@ -184,7 +185,6 @@ buildEditDisplay mode docIdx rangeStart rangeEnd allLines =
              tgtEnd = if null newLines then tgtStart else rangeEnd + length newLines - 1
          in (allDisplayLines, tgtStart, tgtEnd)
 
-       -- Insert: insert new lines before range start
        EditInsert newLines ->
          let insertIdx = rangeStart - 1  -- 0-based position
              linesBefore = [mkLine i StyleNormal | i <- [1..insertIdx]]
@@ -194,7 +194,6 @@ buildEditDisplay mode docIdx rangeStart rangeEnd allLines =
              tgtEnd = if null newLines then tgtStart else insertIdx + length newLines - 1
          in (allDisplayLines, tgtStart, tgtEnd)
 
-       -- Change: show deleted lines, then new lines
        EditChange newLines ->
          let linesBefore = [mkLine i StyleNormal | i <- [1..rangeStart - 1]]
              linesDeleted = [mkLine i StyleDeleted | i <- [rangeStart..rangeEnd]]
@@ -205,7 +204,6 @@ buildEditDisplay mode docIdx rangeStart rangeEnd allLines =
              tgtEnd = tgtStart + numDeleted + length newLines - 1
          in (allDisplayLines, tgtStart, tgtEnd)
 
-       -- Move: delete source, insert copies at target
        EditMove targetLine srcLines ->
          let mkSrcLine i = mkLine i (if i >= rangeStart && i <= rangeEnd then StyleDeleted else StyleNormal)
              linesBefore = [mkSrcLine i | i <- [1..targetLine]]
@@ -213,15 +211,32 @@ buildEditDisplay mode docIdx rangeStart rangeEnd allLines =
              allDisplayLines = linesBefore ++ mkNewLines srcLines ++ linesAfter
          in (allDisplayLines, rangeStart - 1, rangeEnd - 1)
 
-       -- Transfer: copy lines to target (source stays normal)
        EditTransfer targetLine srcLines ->
          let linesBefore = [mkLine i StyleNormal | i <- [1..targetLine]]
              linesAfter = [mkLine i StyleNormal | i <- [targetLine + 1..totalLines]]
              allDisplayLines = linesBefore ++ mkNewLines srcLines ++ linesAfter
          in (allDisplayLines, rangeStart - 1, rangeEnd - 1)
 
+       EditJoin ->
+         let linesBefore = [mkLine i StyleNormal | i <- [1..rangeStart - 1]]
+             linesDeleted = [mkLine i StyleDeleted | i <- [rangeStart..rangeEnd]]
+             linesAfter = [mkLine i StyleNormal | i <- [rangeEnd + 1..totalLines]]
+             -- Preview the joined line
+             joinedText = T.concat [indexText allLines (i - 1) | i <- [rangeStart..rangeEnd]]
+             joinedLine = DisplayLine
+               { dlLineNum = Nothing
+               , dlSourceLine = Nothing
+               , dlDocIdx = docIdx
+               , dlText = joinedText
+               , dlStyle = StyleSelected
+               , dlHighlights = []
+               }
+             allDisplayLines = linesBefore ++ linesDeleted ++ [joinedLine] ++ linesAfter
+             numDeleted = rangeEnd - rangeStart + 1
+             tgtStart = rangeStart - 1
+             tgtEnd = tgtStart + numDeleted  -- Include the joined preview line
+         in (allDisplayLines, tgtStart, tgtEnd)
 
--- Rendering
 
 renderToVty :: Vty.Vty -> DisplayZone -> Text -> Bool -> IO ()
 renderToVty vty dz inputText isError = do
@@ -483,8 +498,6 @@ splitHighlights splitPoint hls = (current, shifted)
 -- Type alias for param stack for clarity
 type ParamStack = [(Text, DocumentState)]
 
--- This is the main function for Phase 2 - it examines the parse state
--- and generates appropriate display content.
 -- Display behavior:
 -- - On entry (PPEmpty): Show current document with current line highlighted
 -- - When doc range typed (no line range): Show document list for that range
@@ -573,6 +586,10 @@ showCommandRange cmd dl paramStack width height =
     Change (FullRange docRange lineRange) txt _ ->
       showEditPreview (EditChange (T.lines txt)) docRange lineRange dl paramStack width height
 
+    -- Join: show lines being joined as deleted, preview joined result
+    Join (FullRange docRange lineRange) _ ->
+      showEditPreview EditJoin docRange lineRange dl paramStack width height
+
     -- Substitute: show matches with strikethrough and replacements in yellow
     Substitute (FullRange docRange lineRange) pat repl flags _ ->
       showSubstituteReplacePreview docRange lineRange pat repl flags dl paramStack width height
@@ -593,91 +610,38 @@ showCommandRange cmd dl paramStack width height =
 
 
 -- Shows lines with regex matches highlighted in strikethrough.
--- When pattern only is available, shows first match per line with smart search if pattern is all lowercase.
 showSubstitutePatternPreview :: DocRange -> LineRange -> Text -> DocumentList -> ParamStack -> Int -> Int -> DisplayZone
 showSubstitutePatternPreview docRange lineRange pat dl paramStack width height =
   case docRange of
     DocDefault ->
-      let curDoc = dlCurrentDoc dl
-      in case getDocStateAt curDoc dl of
-        Nothing -> emptyDisplayZone width height
-        Just docState ->
-          let doc = docDocument docState
-              curLine = docCurrentLine docState
-              totalLines = lineCount doc
-              allLines = documentLines doc
-              marks = docMarks docState
-              -- Resolve line range
-              (startLine, endLine) = case lineRange of
-                LineDefault -> (curLine, curLine)
-                _ -> case resolveLineRange curLine totalLines marks allLines lineRange of
-                  Left _ -> (curLine, curLine)
-                  Right (s, e) -> (s, e)
-              -- Try to compile the regex
-              mBre = case RE.parseBRE pat of
-                Left _ -> Nothing
-                Right bre -> Just bre
-              -- Smart search: pattern all lowercase means case-insensitive matching
-              -- No replacement yet, so we use default flags (first match only)
-              smartMode = isAllLower pat
-              defaultFlags = SubstFlags False 0 False  -- first match only
-              -- Build display lines with match highlights
-              displayLines = buildSubstitutePreviewLines curDoc mBre Nothing defaultFlags smartMode allLines startLine endLine totalLines
-              -- Target range for scroll check (0-based)
-              targetStart = startLine - 1
-              targetEnd = endLine - 1
-              scrollTop = scrollToShowRange targetStart targetEnd (length displayLines) height
-          in DisplayZone
-            { dzLines = V.fromList displayLines
-            , dzScrollTop = scrollTop
-            , dzHeight = height
-            , dzWidth = width
-            , dzTargetRange = Just (targetStart, targetEnd)
-            }
+      withDocState (dlCurrentDoc dl) dl width height $ \docState ->
+        let (curLine, total, allLines, marks) = docInfo docState
+            (startLine, endLine) = resolveRange curLine total marks allLines lineRange defaultRangeCurrent
+            mBre = either (const Nothing) Just (RE.parseBRE pat)
+            smartMode = isAllLower pat
+            defaultFlags = SubstFlags False 0 False
+            displayLines = buildSubstitutePreviewLines (dlCurrentDoc dl) mBre Nothing defaultFlags smartMode allLines startLine endLine total
+            targetStart = startLine - 1
+            targetEnd = endLine - 1
+        in mkDisplayZone displayLines (scrollToShowRange targetStart targetEnd (length displayLines) height) width height (Just (targetStart, targetEnd))
     _ ->
       showResolvedRangeWithDefault docRange lineRange defaultRangeCurrent dl paramStack width height
 
 
 -- Shows lines with regex matches in strikethrough and replacement text in yellow.
--- Respects smart search/replace and substitute flags.
 showSubstituteReplacePreview :: DocRange -> LineRange -> Text -> Text -> SubstFlags -> DocumentList -> ParamStack -> Int -> Int -> DisplayZone
 showSubstituteReplacePreview docRange lineRange pat repl flags dl paramStack width height =
   case docRange of
     DocDefault ->
-      let curDoc = dlCurrentDoc dl
-      in case getDocStateAt curDoc dl of
-        Nothing -> emptyDisplayZone width height
-        Just docState ->
-          let doc = docDocument docState
-              curLine = docCurrentLine docState
-              totalLines = lineCount doc
-              allLines = documentLines doc
-              marks = docMarks docState
-              -- Resolve line range
-              (startLine, endLine) = case lineRange of
-                LineDefault -> (curLine, curLine)
-                _ -> case resolveLineRange curLine totalLines marks allLines lineRange of
-                  Left _ -> (curLine, curLine)
-                  Right (s, e) -> (s, e)
-              -- Try to compile the regex
-              mBre = case RE.parseBRE pat of
-                Left _ -> Nothing
-                Right bre -> Just bre
-              -- Smart search/replace mode: pattern and replacement are all lowercase, no i flag
-              smartMode = isSmartReplaceEligible pat repl (sfInsensitive flags)
-              -- Build display lines with match and replacement highlights
-              displayLines = buildSubstitutePreviewLines curDoc mBre (Just repl) flags smartMode allLines startLine endLine totalLines
-              -- Target range for scroll check (0-based)
-              targetStart = startLine - 1
-              targetEnd = endLine - 1
-              scrollTop = scrollToShowRange targetStart targetEnd (length displayLines) height
-          in DisplayZone
-            { dzLines = V.fromList displayLines
-            , dzScrollTop = scrollTop
-            , dzHeight = height
-            , dzWidth = width
-            , dzTargetRange = Just (targetStart, targetEnd)
-            }
+      withDocState (dlCurrentDoc dl) dl width height $ \docState ->
+        let (curLine, total, allLines, marks) = docInfo docState
+            (startLine, endLine) = resolveRange curLine total marks allLines lineRange defaultRangeCurrent
+            mBre = either (const Nothing) Just (RE.parseBRE pat)
+            smartMode = isSmartReplaceEligible pat repl (sfInsensitive flags)
+            displayLines = buildSubstitutePreviewLines (dlCurrentDoc dl) mBre (Just repl) flags smartMode allLines startLine endLine total
+            targetStart = startLine - 1
+            targetEnd = endLine - 1
+        in mkDisplayZone displayLines (scrollToShowRange targetStart targetEnd (length displayLines) height) width height (Just (targetStart, targetEnd))
     _ ->
       showResolvedRangeWithDefault docRange lineRange defaultRangeCurrent dl paramStack width height
 
@@ -826,77 +790,29 @@ showMoveTransferCommand isMove docRange lineRange target dl paramStack width hei
   case docRange of
     DocDefault ->
       let curDoc = dlCurrentDoc dl
-      in case getDocStateAt curDoc dl of
-        Nothing -> emptyDisplayZone width height
-        Just docState ->
-          let doc = docDocument docState
-              curLine = docCurrentLine docState
-              totalLines = lineCount doc
-              allLines = documentLines doc
-              marks = docMarks docState
-              -- Resolve source range
-              (srcStart, srcEnd) = case lineRange of
-                LineDefault -> defaultRangeCurrent curLine totalLines
-                _ -> case resolveLineRange curLine totalLines marks allLines lineRange of
-                  Left _ -> defaultRangeCurrent curLine totalLines
-                  Right r -> r
-              -- Resolve target
-              mTargetLine = resolveTargetAddr target curDoc curLine dl
-              targetLine = fromMaybe 0 mTargetLine
-              -- Get source line texts
-              srcLines = [indexText allLines (i - 1) | i <- [srcStart..srcEnd]]
-              -- Build display using unified edit system
-              editMode = if isMove
-                then EditMove targetLine srcLines
-                else EditTransfer targetLine srcLines
-              (displayLines, tgtStart, tgtEnd) = buildEditDisplay editMode curDoc srcStart srcEnd allLines
-              scrollTop = scrollToShowRange tgtStart tgtEnd (length displayLines) height
-          in DisplayZone
-            { dzLines = V.fromList displayLines
-            , dzScrollTop = scrollTop
-            , dzHeight = height
-            , dzWidth = width
-            , dzTargetRange = Just (tgtStart, tgtEnd)
-            }
+      in withDocState curDoc dl width height $ \docState ->
+        let (curLine, total, allLines, marks) = docInfo docState
+            (srcStart, srcEnd) = resolveRange curLine total marks allLines lineRange defaultRangeCurrent
+            targetLine = fromMaybe 0 (resolveTargetAddr target curDoc curLine dl)
+            srcLines = [indexText allLines (i - 1) | i <- [srcStart..srcEnd]]
+            editMode = if isMove then EditMove targetLine srcLines else EditTransfer targetLine srcLines
+            (displayLines, tgtStart, tgtEnd) = buildEditDisplay editMode curDoc srcStart srcEnd allLines
+        in mkDisplayZone displayLines (scrollToShowRange tgtStart tgtEnd (length displayLines) height) width height (Just (tgtStart, tgtEnd))
     _ ->
       showResolvedRangeWithDefault docRange lineRange defaultRangeCurrent dl paramStack width height
 
 
 resolveTargetAddr :: TargetAddr -> Int -> Int -> DocumentList -> Maybe Int
 resolveTargetAddr target curDoc curLine dl =
-  case target of
-    LocalTarget addr ->
-      case getDocStateAt curDoc dl of
-        Nothing -> Nothing
-        Just docState ->
-          let totalLines = lineCount (docDocument docState)
-              marks = docMarks docState
-              allLines = documentLines (docDocument docState)
-          in case resolveAddr curLine totalLines marks allLines addr of
-            Left _ -> Nothing
-            Right n -> Just n
-
-    CrossDocTarget _docRange addr ->
-      case getDocStateAt curDoc dl of
-        Nothing -> Nothing
-        Just docState ->
-          let totalLines = lineCount (docDocument docState)
-              marks = docMarks docState
-              allLines = documentLines (docDocument docState)
-          in case resolveAddr curLine totalLines marks allLines addr of
-            Left _ -> Nothing
-            Right n -> Just n
-
-    ParamTarget _ addr ->
-      case getDocStateAt curDoc dl of
-        Nothing -> Nothing
-        Just docState ->
-          let totalLines = lineCount (docDocument docState)
-              marks = docMarks docState
-              allLines = documentLines (docDocument docState)
-          in case resolveAddr curLine totalLines marks allLines addr of
-            Left _ -> Nothing
-            Right n -> Just n
+  let addr = case target of
+        LocalTarget a      -> a
+        CrossDocTarget _ a -> a
+        ParamTarget _ a    -> a
+  in case getDocStateAt curDoc dl of
+    Nothing -> Nothing
+    Just docState ->
+      let (_, total, allLines, marks) = docInfo docState
+      in either (const Nothing) Just $ resolveAddr curLine total marks allLines addr
 
 
 -- Returns a function that takes (curLine, totalLines) and returns (startLine, endLine).
@@ -1031,74 +947,26 @@ showAddressPreview docRange lineRange dl paramStack width height =
 
 showDocumentScrolledTo :: Int -> LineRange -> DocumentList -> Int -> Int -> DisplayZone
 showDocumentScrolledTo docIdx lineRange dl width height =
-  case getDocStateAt docIdx dl of
-    Nothing -> emptyDisplayZone width height
-    Just docState ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          marks = docMarks docState
-          -- Resolve line range
-          (hlStart, hlEnd) = case resolveLineRange curLine totalLines marks allLines lineRange of
-            Left _ -> (curLine, curLine)  -- Fallback to current line
-            Right r -> r
-          -- Create display lines for the entire document
-          displayLines = V.fromList
-            [ DisplayLine
-              { dlLineNum = Just i
-              , dlSourceLine = Just i
-              , dlDocIdx = docIdx
-              , dlText = indexText allLines (i - 1)
-              , dlStyle = if i >= hlStart && i <= hlEnd then StyleSelected else StyleNormal
-              , dlHighlights = []
-              }
-            | i <- [1 .. totalLines]
-            ]
-          -- Scroll to show entire highlighted range if possible
-          targetStart = hlStart - 1
-          targetEnd = hlEnd - 1
-          scrollTop = scrollToShowRange targetStart targetEnd totalLines height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (targetStart, targetEnd)
-        }
+  withDocState docIdx dl width height $ \docState ->
+    let (curLine, total, allLines, marks) = docInfo docState
+        (hlStart, hlEnd) = resolveRange curLine total marks allLines lineRange defaultRangeCurrent
+        displayLines = [makeDisplayLine docIdx i (indexText allLines (i - 1))
+                         (if i >= hlStart && i <= hlEnd then StyleSelected else StyleNormal)
+                       | i <- [1..total]]
+        targetStart = hlStart - 1
+        targetEnd = hlEnd - 1
+    in mkDisplayZone displayLines (scrollToShowRange targetStart targetEnd total height) width height (Just (targetStart, targetEnd))
 
 
 showEntireDocument :: Int -> DocumentList -> Int -> Int -> DisplayZone
 showEntireDocument docIdx dl width height =
-  case getDocStateAt docIdx dl of
-    Nothing -> emptyDisplayZone width height
-    Just docState ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          -- Create display lines for the entire document
-          displayLines = V.fromList
-            [ DisplayLine
-              { dlLineNum = Just i
-              , dlSourceLine = Just i
-              , dlDocIdx = docIdx
-              , dlText = indexText allLines (i - 1)
-              , dlStyle = if i == curLine then StyleSelected else StyleNormal
-              , dlHighlights = []
-              }
-            | i <- [1 .. totalLines]
-            ]
-          -- Center on current line
-          targetLine = curLine - 1
-          scrollTop = centerOnLine targetLine totalLines height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (targetLine, targetLine)
-        }
+  withDocState docIdx dl width height $ \docState ->
+    let (curLine, total, allLines, _) = docInfo docState
+        displayLines = [makeDisplayLine docIdx i (indexText allLines (i - 1))
+                         (if i == curLine then StyleSelected else StyleNormal)
+                       | i <- [1..total]]
+        targetLine = curLine - 1
+    in mkDisplayZone displayLines (centerOnLine targetLine total height) width height (Just (targetLine, targetLine))
 
 
 showDocumentListRange :: Int -> Int -> DocumentList -> Int -> Int -> DisplayZone
@@ -1206,75 +1074,30 @@ showResolvedRangeWithDefault docRange lineRange defaultRangeFn dl paramStack wid
 
 
 
--- Shows the ENTIRE document with the specified range highlighted.
+-- Shows entire document with the specified range highlighted.
 showLineRangeInDocWithDefault :: Int -> LineRange -> (Int -> Int -> (Int, Int)) -> DocumentList -> Int -> Int -> DisplayZone
 showLineRangeInDocWithDefault docIdx lineRange defaultRangeFn dl width height =
-  case getDocStateAt docIdx dl of
-    Nothing -> emptyDisplayZone width height
-    Just docState ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          marks = docMarks docState
-          -- Apply default range when LineDefault
-          effectiveRange = case lineRange of
-            LineDefault ->
-              let (s, e) = defaultRangeFn curLine totalLines
-              in LineFree (Number s) (Number e)
-            _ -> lineRange
-      in case resolveLineRange curLine totalLines marks allLines effectiveRange of
-        Left _ -> emptyDisplayZone width height  -- Show empty on resolution error
-        Right (lineStart, lineEnd) ->
-          -- Show entire document with the range highlighted
-          let displayLines = V.fromList
-                [ DisplayLine
-                  { dlLineNum = Just i
-                  , dlSourceLine = Just i
-                  , dlDocIdx = docIdx
-                  , dlText = indexText allLines (i - 1)
-                  , dlStyle = if i >= lineStart && i <= lineEnd then StyleSelected else StyleNormal
-                  , dlHighlights = []
-                  }
-                | i <- [1 .. totalLines]
-                ]
-              -- Scroll to show entire range if possible, otherwise first line at top
-              targetStart = lineStart - 1
-              targetEnd = lineEnd - 1
-              scrollTop = scrollToShowRange targetStart targetEnd totalLines height
-          in DisplayZone
-            { dzLines = displayLines
-            , dzScrollTop = scrollTop
-            , dzHeight = height
-            , dzWidth = width
-            , dzTargetRange = Just (targetStart, targetEnd)
-            }
+  withDocState docIdx dl width height $ \docState ->
+    let (curLine, total, allLines, marks) = docInfo docState
+        (lineStart, lineEnd) = resolveRange curLine total marks allLines lineRange defaultRangeFn
+        displayLines = [makeDisplayLine docIdx i (indexText allLines (i - 1))
+                         (if i >= lineStart && i <= lineEnd then StyleSelected else StyleNormal)
+                       | i <- [1..total]]
+        targetStart = lineStart - 1
+        targetEnd = lineEnd - 1
+    in mkDisplayZone displayLines (scrollToShowRange targetStart targetEnd total height) width height (Just (targetStart, targetEnd))
 
 
 
 
 showLineRange :: Int -> Int -> Int -> DocumentList -> Int -> Int -> DisplayZone
 showLineRange docIdx lineStart lineEnd dl width height =
-  case getDocStateAt docIdx dl of
-    Nothing -> emptyDisplayZone width height
-    Just docState ->
-      let doc = docDocument docState
-          allLines = documentLines doc
-          -- Only include lines within the range
-          rangeLineCount = lineEnd - lineStart + 1
-          displayLines = V.fromList
-            [ makeDisplayLine docIdx i (indexText allLines (i - 1)) StyleSelected
-            | i <- [lineStart .. lineEnd]
-            ]
-          -- Start at top since we're only showing the range
-          scrollTop = centerOnLine (rangeLineCount `div` 2) rangeLineCount height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (0, rangeLineCount - 1)  -- All displayed lines are the target
-        }
+  withDocState docIdx dl width height $ \docState ->
+    let (_, _, allLines, _) = docInfo docState
+        rangeLineCount = lineEnd - lineStart + 1
+        displayLines = [makeDisplayLine docIdx i (indexText allLines (i - 1)) StyleSelected
+                       | i <- [lineStart..lineEnd]]
+    in mkDisplayZone displayLines (centerOnLine (rangeLineCount `div` 2) rangeLineCount height) width height (Just (0, rangeLineCount - 1))
 
 
 showDocRangeWithDefault :: Int -> Int -> LineRange -> (Int -> Int -> (Int, Int)) -> DocumentList -> Int -> Int -> DisplayZone
@@ -1350,36 +1173,17 @@ makeDisplayLine docIdx lineNum text style = DisplayLine
 showCurrentPosition :: DocumentList -> Int -> Int -> DisplayZone
 showCurrentPosition dl width height =
   let curDoc = dlCurrentDoc dl
-      mDocState = getDocStateAt curDoc dl
-  in case mDocState of
-    Nothing ->
-      -- No document, show doc list
-      showDocumentList dl width height
+  in case getDocStateAt curDoc dl of
+    Nothing -> showDocumentList dl width height
     Just docState ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          -- Create display lines
-          displayLines = V.fromList
-            [ makeDisplayLine curDoc (i + 1) (indexText allLines i) $
-                if i + 1 == curLine then StyleSelected else StyleNormal
-            | i <- [0 .. totalLines - 1]
-            ]
-          -- Center on current line
+      let (curLine, total, allLines, _) = docInfo docState
+          displayLines = [makeDisplayLine curDoc i (indexText allLines (i - 1))
+                           (if i == curLine then StyleSelected else StyleNormal)
+                         | i <- [1..total]]
           targetLine = curLine - 1
-          scrollTop = centerOnLine targetLine totalLines height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (targetLine, targetLine)
-        }
+      in mkDisplayZone displayLines (centerOnLine targetLine total height) width height (Just (targetLine, targetLine))
 
 
--- Markers: > in gutter = current document, * suffix = modified
--- Format matches &,n command output: "lineNum\t>filename*"
 showDocumentList :: DocumentList -> Int -> Int -> DisplayZone
 showDocumentList dl width height =
   let dlState = dlDocListState dl
@@ -1426,7 +1230,6 @@ showDocumentList dl width height =
         }
 
 
--- | Show document list with only modified documents highlighted.
 -- Non-consecutive modified documents are all highlighted.
 showModifiedDocumentList :: DocumentList -> Int -> Int -> DisplayZone
 showModifiedDocumentList dl width height =
@@ -1478,71 +1281,18 @@ showModifiedDocumentList dl width height =
         }
 
 
--- | Show a parameter document with optional line range highlighting.
 showParamDocument :: LineRange -> [(Text, DocumentState)] -> Int -> Int -> DisplayZone
 showParamDocument lineRange paramStack width height =
-  case paramStack of
-    [] -> emptyDisplayZone width height
-    ((_, docState):_) ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          marks = docMarks docState
-          -- Resolve line range
-          (hlStart, hlEnd) = case lineRange of
-            LineDefault -> (curLine, curLine)
-            _ -> case resolveLineRange curLine totalLines marks allLines lineRange of
-              Left _ -> (curLine, curLine)
-              Right r -> r
-          -- Create display lines
-          displayLines = V.fromList
-            [ DisplayLine
-              { dlLineNum = Just i
-              , dlSourceLine = Just i
-              , dlDocIdx = -1  -- Negative to indicate param doc
-              , dlText = indexText allLines (i - 1)
-              , dlStyle = if i >= hlStart && i <= hlEnd then StyleSelected else StyleNormal
-              , dlHighlights = []
-              }
-            | i <- [1 .. totalLines]
-            ]
-          targetStart = hlStart - 1
-          targetEnd = hlEnd - 1
-          scrollTop = scrollToShowRange targetStart targetEnd totalLines height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (targetStart, targetEnd)
-        }
+  showParamDocumentWithDefault lineRange defaultRangeCurrent paramStack width height
 
-
--- | Show a parameter document with default range function.
 showParamDocumentWithDefault :: LineRange -> (Int -> Int -> (Int, Int)) -> ParamStack -> Int -> Int -> DisplayZone
 showParamDocumentWithDefault lineRange defaultRangeFn paramStack width height =
   case paramStack of
     [] -> emptyDisplayZone width height
     ((_, docState):_) ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          marks = docMarks docState
-          -- Apply default range when LineDefault
-          effectiveRange = case lineRange of
-            LineDefault ->
-              let (s, e) = defaultRangeFn curLine totalLines
-              in LineFree (Number s) (Number e)
-            _ -> lineRange
-          -- Resolve line range
-          (hlStart, hlEnd) = case resolveLineRange curLine totalLines marks allLines effectiveRange of
-            Left _ -> (curLine, curLine)
-            Right r -> r
-          -- Create display lines
-          displayLines = V.fromList
-            [ DisplayLine
+      let (curLine, total, allLines, marks) = docInfo docState
+          (hlStart, hlEnd) = resolveRange curLine total marks allLines lineRange defaultRangeFn
+          displayLines = [DisplayLine
               { dlLineNum = Just i
               , dlSourceLine = Just i
               , dlDocIdx = -1  -- Negative to indicate param doc
@@ -1550,18 +1300,10 @@ showParamDocumentWithDefault lineRange defaultRangeFn paramStack width height =
               , dlStyle = if i >= hlStart && i <= hlEnd then StyleSelected else StyleNormal
               , dlHighlights = []
               }
-            | i <- [1 .. totalLines]
-            ]
+            | i <- [1..total]]
           targetStart = hlStart - 1
           targetEnd = hlEnd - 1
-          scrollTop = scrollToShowRange targetStart targetEnd totalLines height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (targetStart, targetEnd)
-        }
+      in mkDisplayZone displayLines (scrollToShowRange targetStart targetEnd total height) width height (Just (targetStart, targetEnd))
 
 
 showAddressRange :: Int -> Int -> Int -> Int -> DocumentList -> Int -> Int -> DisplayZone

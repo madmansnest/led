@@ -13,12 +13,7 @@ module LedDocument
   , getLines
   , getLinesAsRope
   , replaceLines
-  , appendAfter
-  , appendRopeAfter
-  , deleteLines
-  , deleteLinesBatch
-  , joinLines
-  , mapLinesInRange
+  , replaceLinesRope
   , LineDiff(..)
   , computeLineDiffs
   , applyLineDiffs
@@ -26,7 +21,6 @@ module LedDocument
 
 import Data.Hashable (hash)
 import Data.Text.Rope (Rope)
-import qualified Data.IntSet as IntSet
 import qualified Data.Text as T
 import qualified Data.Text.Rope as Rope
 
@@ -110,106 +104,24 @@ getLinesAsRope start end doc
 splitAtLineRope :: Int -> Rope -> (Rope, Rope)
 splitAtLineRope n rope = Rope.splitAtLine (fromIntegral n) rope
 
--- Line numbers are 1-based.
 replaceLines :: Int -> Int -> [Text] -> Document -> Document
-replaceLines start end newLines doc
-  | docLineCount doc == 0 && null newLines = emptyDocument
-  | docLineCount doc == 0 = fromLines newLines
-  | otherwise =
-      let (before, rest) = splitAtLineRope (start - 1) (docRope doc)
-          (_, after) = splitAtLineRope (end - start + 1) rest
-          middle = if null newLines
+replaceLines index count newLines doc =
+  let newContent = if null newLines
                    then mempty
                    else Rope.fromText (T.unlines newLines)
-          newRope = before <> middle <> after
-      in fromRope newRope
+  in replaceLinesRope index count newContent doc
 
-appendAfter :: Int -> [Text] -> Document -> Document
-appendAfter nth newLines doc
-  | null newLines = doc
-  | nth <= 0 = replaceLines 1 0 newLines doc
-  | nth >= docLineCount doc =
-      -- Append at end - just concatenate
-      let addition = Rope.fromText (T.unlines newLines)
-          -- Ensure there's a newline before appending if document is non-empty
-          newRope = if docLineCount doc == 0
-                    then addition
-                    else docRope doc <> addition
-      in fromRope newRope
-  | otherwise = replaceLines (nth + 1) nth newLines doc
-
--- Efficient for cross-document transfers - avoids text conversion.
-appendRopeAfter :: Int -> Rope -> Document -> Document
-appendRopeAfter nth rope doc
-  | Rope.null rope = doc
-  | nth <= 0 =
-      let newRope = rope <> docRope doc
-      in fromRope newRope
-  | nth >= docLineCount doc =
-      let newRope = docRope doc <> rope
-      in fromRope newRope
+replaceLinesRope :: Int -> Int -> Rope -> Document -> Document
+replaceLinesRope index count newContent doc
+  | docLineCount doc == 0 && Rope.null newContent = emptyDocument
+  | docLineCount doc == 0 = fromRope newContent
   | otherwise =
-      let (before, after) = splitAtLineRope nth (docRope doc)
-          newRope = before <> rope <> after
+      let safeIndex = max 1 index
+          safeCount = max 0 count
+          (before, rest) = splitAtLineRope (safeIndex - 1) (docRope doc)
+          (_, after) = splitAtLineRope safeCount rest
+          newRope = before <> newContent <> after
       in fromRope newRope
-
-deleteLines :: Int -> Int -> Document -> Document
-deleteLines start end doc = replaceLines start end [] doc
-
-joinLines :: Int -> Int -> Document -> Document
-joinLines start end doc
-  | start > end || start < 1 || end > docLineCount doc = doc
-  | start == end = doc  -- Single line, nothing to join
-  | otherwise =
-      let lns = getLines start end doc
-          joined = T.concat lns
-      in replaceLines start end [joined] doc
-
--- ---------------------------------------------------------------------------
--- Batch operations for global commands
--- ---------------------------------------------------------------------------
-
--- Lines to delete should be a list of 1-based line numbers.
-deleteLinesBatch :: [Int] -> Document -> Document
-deleteLinesBatch [] doc = doc
-deleteLinesBatch linesToDelete doc =
-  let deleteSet = IntSet.fromList linesToDelete
-      lns = documentLines doc
-      kept = [ line | (i, line) <- zip [1..] lns, not (IntSet.member i deleteSet) ]
-  in fromLines kept
-
--- The function receives (lineNumber, lineContent) and returns Maybe newContent.
--- Nothing means delete the line, Just content means replace it.
--- Returns (newDocument, lastModifiedLine, anyChanged).
--- This is O(n) but processes all lines in a single pass.
-mapLinesInRange :: Int -> Int -> (Int -> Text -> Maybe Text) -> Document -> (Document, Int, Bool)
-mapLinesInRange start end f doc
-  | start > end || start < 1 = (doc, 0, False)
-  | otherwise =
-      let lns = documentLines doc
-          total = docLineCount doc
-          actualEnd = min end total
-          -- Process lines: before range, in range (mapped), after range
-          beforeLines = take (start - 1) lns
-          rangeLines = take (actualEnd - start + 1) (drop (start - 1) lns)
-          afterLines = drop actualEnd lns
-          -- Map the function over range lines, tracking changes
-          (mappedLines, lastMod, changed) = processLines start rangeLines
-          newLines = beforeLines ++ mappedLines ++ afterLines
-      in (fromLines newLines, lastMod, changed)
-  where
-    processLines _ [] = ([], 0, False)
-    processLines lineNum (l:ls) =
-      let result = f lineNum l
-          (restLines, restLast, restChanged) = processLines (lineNum + 1) ls
-      in case result of
-        Nothing ->
-          -- Line deleted
-          (restLines, if restLast == 0 then lineNum else restLast, True)
-        Just newL ->
-          let thisChanged = newL /= l
-              newLast = if thisChanged then lineNum else restLast
-          in (newL : restLines, if restLast == 0 then newLast else restLast, thisChanged || restChanged)
 
 -- Represents replacing lines [start, end) with new lines.
 -- Line numbers are 1-based, end is exclusive.
