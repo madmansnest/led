@@ -20,7 +20,7 @@ import Data.List ((!?))
 
 import LedDocument (Document, LineDiff(..), documentLines, fromLines, lineCount, computeLineDiffs, applyLineDiffs)
 import LedNexus (BufferChangeFlag(..), DocumentState(..), DocumentList(..), dlDocuments, emptyDocumentState, emptyDocumentList, documentCount, getDocStateAt, setDocStateAt, dlCurrentDoc, dlDocListState, setDlCurrentDoc)
-import LedParse (DocRange, LineRange)
+import LedParse (Command, DocRange, LineRange)
 import qualified LedRegularExpressions as RE
 
 data UndoManager = UndoManager
@@ -328,6 +328,7 @@ data LedState = LedState
   , ledLastLineRange    :: Maybe LineRange
   , ledMultiDocPrint    :: Maybe Int  -- Just docNum when printing across multiple docs
   , ledVisualMode       :: Bool       -- Currently in visual mode?
+  , ledLastCommand      :: Maybe Command  -- Last repeatable command for 're'
   }
 
 initialState :: UndoManager -> Bool -> Bool -> Maybe Text -> [FilePath] -> [FilePath] -> FilePath -> LedState
@@ -360,6 +361,7 @@ initialState undoMgr silent interactive prompt execFiles files cwd = LedState
   , ledLastLineRange    = Nothing
   , ledMultiDocPrint    = Nothing
   , ledVisualMode       = False
+  , ledLastCommand      = Nothing
   }
 
 -- 1-based indexing

@@ -16,7 +16,6 @@ import LedInput (Led, readInputText)
 import LedNexus (BufferChangeFlag(..), DocumentState(..), documentCount, getDocStateAt, setDocStateAt, dlDocList, dlCurrentDoc, dlDocListState, insertLinesIntoDocState)
 import LedParse (Addr, DocRange(..), SubstFlags(..), TargetAddr(..))
 import LedResolve (resolveDocRange)
-import LedSession (adjustMarksDelete, adjustMarksInsert)
 import LedSmartReplace (isSmartReplaceEligible, smartReplace)
 import LedState
 import qualified LedDocument

@@ -3,7 +3,7 @@ module LedViLineSpec (spec) where
 import Test.Hspec
 import qualified Data.Text as T
 
-import LedViLine
+import LedVi.Line
 
 
 spec :: Spec

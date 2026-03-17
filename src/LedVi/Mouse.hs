@@ -1,4 +1,4 @@
-module LedViMouse
+module LedVi.Mouse
   ( MouseState(..)
   , emptyMouseState
 
@@ -12,8 +12,8 @@ module LedViMouse
 import qualified Data.Text as T
 import qualified Data.Vector as V
 
-import LedViState (DisplayZone(..), DisplayLine(..))
-import LedViLine (InputState, inputText, inputFromText)
+import LedVi.Types (DisplayZone(..), DisplayLine(..))
+import LedVi.Line (InputState, inputText, inputFromText)
 
 
 -- Stores the line number where the mouse button was pressed.

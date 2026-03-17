@@ -56,6 +56,8 @@ data Command
   | Undo FullRange | Redo FullRange | ShellCommand Text | ShellFilter FullRange Text | Comment
   | Quit | QuitAlways | TogglePrompt (Maybe Text) | Help | HelpMode
   | VisualMode  -- Toggle visual editing mode (vi command)
+  | Repeat FullRange  -- Repeat last command with optional new range
+  | SetLine FullRange Suffix  -- Bare address: set current line and print
   | InvokeFunction Text FullRange [Text] Suffix
   deriving stock (Eq, Show)
 
@@ -118,7 +120,8 @@ pDocRangeWithColon = choice
 
 pDocRange :: Parser DocRange
 pDocRange = choice
-  [ DocManage <$ (string "&&" <* optional (char ':'))
+  [ DocModified <$ (string "&&*" <* optional (char ':'))
+  , DocManage <$ (string "&&" <* optional (char ':'))
   , DocModified <$ (string "&*" <* optional (char ':'))
   , DocAll <$ (char '&' <* optional (char ':'))
   , DocParam <$ (char '@' <* optional (char ':'))
@@ -180,7 +183,9 @@ pRangedCommand userFns = do
     , try (pSimpleCmd 'j' (Join range)), try (pMarkCmd range)
     , try (pMoveTransfer 'm' (Move range)), try (pMoveTransfer 't' (Transfer range))
     , PrintLineNumber range <$ (char '=' *> space *> eof)
-    , try (pPrintCmd range), try (pFileCmd 'r' (ReadFile range) (ReadShell range) True)
+    , try (pPrintCmd range)
+    , try (string "re" *> space *> eof $> Repeat range)
+    , try (pFileCmd 'r' (ReadFile range) (ReadShell range) True)
     , try (ShellFilter range <$> (char '!' *> takeRest))
     , try (pNoSuffixCmd 'u' (Undo range)), try (pNoSuffixCmd 'U' (Redo range))
     , try (string "wq" *> notFollowedBy alphaNumChar *> space *> pFileOrShell (WriteQuit range) (WriteQuitShell range))
@@ -222,7 +227,7 @@ pPrintCmd range = do
   pure (PrintLines range suf)
 
 pBareRange :: FullRange -> Parser Command
-pBareRange range = eof $> PrintLines range PrintSuffix
+pBareRange range = SetLine range <$> pSuffix <* eof
 
 pTextBody :: Parser (Text, Suffix)
 pTextBody = do
@@ -277,7 +282,9 @@ pGlobalWithCmd :: Char -> (Text -> Text -> Command) -> Parser Command
 pGlobalWithCmd c ctor = do
   _ <- char c
   delim <- satisfy validDelim
-  (pat, _) <- pDelimited delim
+  (pat, closed) <- pDelimited delim
+  -- Require closing delimiter for complete command
+  guard closed
   cmdlist <- takeRest
   pure (ctor pat (if T.null cmdlist then "p" else cmdlist))
 
@@ -417,7 +424,7 @@ feedLines userFns lns =
   let combined = T.intercalate "\n" lns
   in case runParse (pCommand userFns) combined of
        Left err -> if "unexpected end of input" `T.isInfixOf` toText (errorBundlePretty err)
-                   then Incomplete else Failed (toText (errorBundlePretty err))
+                   then Incomplete else Failed "Unknown command"
        Right cmd -> checkMultiline cmd lns
 
 checkMultiline :: Command -> [Text] -> ParseResult
@@ -462,6 +469,7 @@ getCommandRange = \case
   Filename r _ -> Just r; ReadFile r _ -> Just r; ReadShell r _ -> Just r
   Write r _ -> Just r; WriteShell r _ -> Just r; WriteQuit r _ -> Just r; WriteQuitShell r _ -> Just r
   Undo r -> Just r; Redo r -> Just r; ShellFilter r _ -> Just r; InvokeFunction _ r _ _ -> Just r
+  Repeat r -> Just r; SetLine r _ -> Just r
   _ -> Nothing
 
 setCommandRange :: FullRange -> Command -> Command
@@ -478,6 +486,7 @@ setCommandRange r = \case
   Write _ fp -> Write r fp; WriteShell _ c -> WriteShell r c
   WriteQuit _ fp -> WriteQuit r fp; WriteQuitShell _ c -> WriteQuitShell r c
   Undo _ -> Undo r; Redo _ -> Redo r; ShellFilter _ c -> ShellFilter r c; InvokeFunction n _ a s -> InvokeFunction n r a s
+  Repeat _ -> Repeat r; SetLine _ s -> SetLine r s
   cmd -> cmd
 
 isValidFunctionName :: Text -> Bool
@@ -486,4 +495,4 @@ isValidFunctionName name =
 
 systemCommandNames :: Set.Set Text
 systemCommandNames = Set.fromList
-  ["a","c","d","e","E","f","fn","g","G","h","H","i","im","imd","j","k","l","m","n","p","q","Q","r","s","t","u","U","v","V","w","wq","P"]
+  ["a","c","d","e","E","f","fn","g","G","h","H","i","im","imd","j","k","l","m","n","p","q","Q","r","re","s","t","u","U","v","V","w","wq","P"]

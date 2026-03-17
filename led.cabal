@@ -82,6 +82,7 @@ common shared-properties
                     , LedOptions
                     , LedParse
                     , LedPrint
+                    , LedQueue
                     , LedReadWrite
                     , LedRegularExpressions
                     , LedResolve
@@ -91,11 +92,14 @@ common shared-properties
                     , LedState
                     , LedUndo
                     , LedVi
-                    , LedViLine
-                    , LedViMouse
-                    , LedViParse
-                    , LedViRender
-                    , LedViState
+                    , LedVi.Types
+                    , LedVi.Line
+                    , LedVi.Mouse
+                    , LedVi.Parse
+                    , LedVi.Render
+                    , LedVi.Preview
+                    , LedVi.Result
+                    , LedVi.Completion
 
     if flag(release)
       ghc-options:  -fdicts-strict

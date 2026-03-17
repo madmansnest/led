@@ -4,7 +4,7 @@ import Test.Hspec
 import qualified Data.Set as Set
 
 import LedParse (DocRange(..), LineRange(..), Addr(..), Command(..), FullRange(..), Suffix(..), SubstFlags(..))
-import LedViParse
+import LedVi.Parse
 
 
 spec :: Spec
@@ -29,10 +29,10 @@ spec = describe "LedViParse" $ do
           other -> expectationFailure $ "Expected PPCommand, got: " ++ show other
 
       it "returns PPCommand for numbered print (bare address)" $ do
-        -- In ed/led, a bare address like "5" is a print command
+        -- In ed/led, a bare address like "5" sets current line and prints
         case parsePartial "5" of
-          PPCommand (PrintLines (FullRange DocDefault (LineSingle (Number 5))) _) -> pure ()
-          other -> expectationFailure $ "Expected PPCommand PrintLines, got: " ++ show other
+          PPCommand (SetLine (FullRange DocDefault (LineSingle (Number 5))) NoSuffix) -> pure ()
+          other -> expectationFailure $ "Expected PPCommand SetLine, got: " ++ show other
 
       it "returns PPCommand for range print" $ do
         case parsePartial "1,5p" of
@@ -41,27 +41,27 @@ spec = describe "LedViParse" $ do
 
       it "returns PPCommand for current line (bare .)" $ do
         case parsePartial "." of
-          PPCommand (PrintLines (FullRange DocDefault (LineSingle Current)) _) -> pure ()
+          PPCommand (SetLine (FullRange DocDefault (LineSingle Current)) NoSuffix) -> pure ()
           other -> expectationFailure $ "Expected PPCommand, got: " ++ show other
 
       it "returns PPCommand for last line (bare $)" $ do
         case parsePartial "$" of
-          PPCommand (PrintLines (FullRange DocDefault (LineSingle LastLine)) _) -> pure ()
+          PPCommand (SetLine (FullRange DocDefault (LineSingle LastLine)) NoSuffix) -> pure ()
           other -> expectationFailure $ "Expected PPCommand, got: " ++ show other
 
       it "returns PPCommand for range (1,5)" $ do
         case parsePartial "1,5" of
-          PPCommand (PrintLines (FullRange DocDefault (LineFree (Number 1) (Number 5))) _) -> pure ()
+          PPCommand (SetLine (FullRange DocDefault (LineFree (Number 1) (Number 5))) NoSuffix) -> pure ()
           other -> expectationFailure $ "Expected PPCommand, got: " ++ show other
 
       it "returns PPCommand for doc prefix (&)" $ do
         case parsePartial "&" of
-          PPCommand (PrintLines (FullRange DocAll LineDefault) _) -> pure ()
+          PPCommand (SetLine (FullRange DocAll LineDefault) NoSuffix) -> pure ()
           other -> expectationFailure $ "Expected PPCommand, got: " ++ show other
 
       it "returns PPCommand for manage prefix (&&)" $ do
         case parsePartial "&&" of
-          PPCommand (PrintLines (FullRange DocManage LineDefault) _) -> pure ()
+          PPCommand (SetLine (FullRange DocManage LineDefault) NoSuffix) -> pure ()
           other -> expectationFailure $ "Expected PPCommand, got: " ++ show other
 
     describe "substitute command" $ do
@@ -109,8 +109,13 @@ spec = describe "LedViParse" $ do
           other -> expectationFailure $ "Expected insensitive flag, got: " ++ show other
 
     describe "global command" $ do
-      it "treats g/foo as complete (default 'p' command)" $ do
+      it "treats g/foo as incomplete (pattern not closed)" $ do
         case parsePartial "g/foo" of
+          PPGlobalPattern DocDefault LineDefault '/' "foo" -> pure ()
+          other -> expectationFailure $ "Expected PPGlobalPattern, got: " ++ show other
+
+      it "parses g/foo/ as complete (pattern closed, default 'p' command)" $ do
+        case parsePartial "g/foo/" of
           PPCommand (Global _ "foo" "p") -> pure ()
           other -> expectationFailure $ "Expected Global with default p, got: " ++ show other
 
@@ -119,8 +124,13 @@ spec = describe "LedViParse" $ do
           PPCommand (Global _ "foo" "d") -> pure ()
           other -> expectationFailure $ "Expected Global with d, got: " ++ show other
 
-      it "parses v/bar as complete (reverse global)" $ do
+      it "treats v/bar as incomplete (pattern not closed)" $ do
         case parsePartial "v/bar" of
+          PPGlobalPattern DocDefault LineDefault '/' "bar" -> pure ()
+          other -> expectationFailure $ "Expected PPGlobalPattern, got: " ++ show other
+
+      it "parses v/bar/ as complete (reverse global)" $ do
+        case parsePartial "v/bar/" of
           PPCommand (GlobalReverse _ "bar" "p") -> pure ()
           other -> expectationFailure $ "Expected GlobalReverse, got: " ++ show other
 

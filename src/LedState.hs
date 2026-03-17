@@ -3,7 +3,7 @@ module LedState
   , getFilePath, setFilePath
   , modifyDocState, setDocument, setCurrentLine, modifyMarks
   , pushParamDoc, popParamDoc
-  , addressError, setErrorText, augmentErrorWithContext, flagError
+  , addressError, reportError, reportWarning, setErrorText, augmentErrorWithContext, flagError
   , printHelpIfActive
   , guardChanged
   , ensureNonEmptyDocList
@@ -12,6 +12,15 @@ module LedState
   , applyDocListDiff, applyManagedDiff
   , curAndTotal
   , splitGlobalCmds
+    -- * Document access helpers
+  , getDocListWithCurrent
+  , getDocResolutionContext
+  , getLineResolutionContext
+    -- * Mark operations
+  , markLine
+  , adjustMarksInsert
+  , adjustMarksDelete
+  , clearMarks
   ) where
 
 import qualified Data.Map.Strict as Map
@@ -21,7 +30,7 @@ import qualified Data.Text as T
 import LedParse (Addr)
 import LedResolve (resolveAddr)
 import LedCore (LedState(..))
-import LedNexus (BufferChangeFlag(..), DocumentState(..), DocumentList(..), getCurrentDocState, modifyCurrentDocState, setCurrentFilename, getCurrentFilename, documentCount, singletonDocumentList, emptyDocumentState, getDocStateAt, setDocStateAt, setDlCurrentDoc, dlDocListState)
+import LedNexus (BufferChangeFlag(..), DocumentState(..), DocumentList(..), getCurrentDocState, modifyCurrentDocState, setCurrentFilename, getCurrentFilename, documentCount, singletonDocumentList, emptyDocumentState, getDocStateAt, setDocStateAt, setDlCurrentDoc, dlDocListState, dlCurrentDoc, adjustMarksForInsert, adjustMarksForDelete)
 import qualified LedDocument
 import LedManageFiles (computeManageDiff, checkManageWarnings, hasWarnings, formatManageWarnings, executeManageActions, ManageDiff(..))
 import LedIO (readDocument, expandPath, humanisePath)
@@ -70,6 +79,43 @@ setCurrentLine n = modifyDocState (\ds -> ds { docCurrentLine = n })
 modifyMarks :: (Map.Map Char Int -> Map.Map Char Int) -> Led ()
 modifyMarks f = modifyDocState (\ds -> ds { docMarks = f (docMarks ds) })
 
+markLine :: Char -> Int -> Led ()
+markLine c addr = modifyMarks (Map.insert c addr)
+
+adjustMarksInsert :: Int -> Int -> Led ()
+adjustMarksInsert pos count = modifyMarks (adjustMarksForInsert pos count)
+
+adjustMarksDelete :: Int -> Int -> Led ()
+adjustMarksDelete start end = modifyMarks (adjustMarksForDelete start end)
+
+clearMarks :: Led ()
+clearMarks = modifyMarks (const Map.empty)
+
+getDocListWithCurrent :: Led (DocumentList, Int)
+getDocListWithCurrent = do
+  dl <- gets ledDocumentList
+  pure (dl, dlCurrentDoc dl)
+
+getDocResolutionContext :: Led (Int, Int, [Text], Map.Map Char Int)
+getDocResolutionContext = do
+  dl <- gets ledDocumentList
+  let curDoc = dlCurrentDoc dl
+      total = documentCount dl
+      dlState = dlDocListState dl
+      filenames = LedDocument.documentLines (docDocument dlState)
+      marks = docMarks dlState
+  pure (curDoc, total, filenames, marks)
+
+getLineResolutionContext :: Led (Int, Int, Map.Map Char Int, [Text])
+getLineResolutionContext = do
+  doc <- getDocument
+  cur <- getCurrentLine
+  marks <- getMarks
+  let total = LedDocument.lineCount doc
+      docLines = LedDocument.documentLines doc
+  pure (cur, total, marks, docLines)
+
+
 pushParamDoc :: Text -> DocumentState -> Led ()
 pushParamDoc name ds = modify (\s -> s { ledParamStack = (name, ds) : ledParamStack s })
 
@@ -77,11 +123,17 @@ popParamDoc :: Led ()
 popParamDoc = modify (\s -> s { ledParamStack = drop 1 (ledParamStack s) })
 
 addressError :: Text -> Led ()
-addressError msg = do
+addressError = reportError
+
+reportError :: Text -> Led ()
+reportError msg = do
   setErrorText msg
   flagError
   outputLine "?"
   printHelpIfActive
+
+reportWarning :: Text -> Led ()
+reportWarning msg = reportError ("Warning: " <> msg)
 
 setErrorText :: Text -> Led ()
 setErrorText msg = do
@@ -117,15 +169,11 @@ printHelpIfActive = gets ledHelpMode >>= bool (pure ()) printLastError
 
 guardChanged :: Led Bool
 guardChanged = getChangeFlag >>= \case
-    Changed -> warnUnsaved >> pure False
-    _       -> pure True
-  where
-    warnUnsaved = do
-      setErrorText "Warning: buffer modified"
-      flagError
+    Changed -> do
+      reportWarning "buffer modified"
       setChangeFlag ChangedAndWarned
-      outputLine "?"
-      printHelpIfActive
+      pure False
+    _ -> pure True
 
 ensureNonEmptyDocList :: Led ()
 ensureNonEmptyDocList = do
@@ -223,8 +271,6 @@ applyDocListDiff origDlState newLines = do
                 [deleteStart..deleteEnd]
           if hasUnsaved
             then do
-              setErrorText "Warning: document modified"
-              flagError
               forM_ [deleteStart..deleteEnd] $ \idx ->
                 case getDocStateAt idx dl of
                   Just ds | docChangeFlag ds == Changed ->
@@ -232,8 +278,7 @@ applyDocListDiff origDlState newLines = do
                   _ -> pure ()
               modify (\s -> let dl' = ledDocumentList s
                             in s { ledDocumentList = dl' { dlDocListState = origDlState } })
-              outputLine "?"
-              printHelpIfActive
+              reportWarning "document modified"
               pure True
             else do
               removeDocStates deleteStart deleteEnd
@@ -257,13 +302,10 @@ applyManagedDiff origDlState newLines = do
       warned <- gets ledManageWarned
       if hasWarnings warnings && not warned
         then do
-          setErrorText ("Warning: " <> formatManageWarnings warnings)
-          flagError
           modify (\s -> s { ledManageWarned = True })
           modify (\s -> let dl = ledDocumentList s
                         in s { ledDocumentList = dl { dlDocListState = origDlState } })
-          outputLine "?"
-          printHelpIfActive
+          reportWarning (formatManageWarnings warnings)
         else do
           dl <- gets ledDocumentList
           let renamedStates = [ (idx, ds)
@@ -295,5 +337,31 @@ splitGlobalCmds = go "" []
   where
     go acc cmds t = case T.uncons t of
       Nothing -> reverse (acc : cmds)
-      Just ('\n', r) -> go "" (acc : cmds) r
+      Just ('\n', r) ->
+        -- Check if this is a/i/c command AND remaining text has a "." terminator
+        if isBlockTextCmd acc && hasBlockTerminator r
+          then goBlockText (acc <> "\n") cmds r  -- Read until "." terminator
+          else go "" (acc : cmds) r
       Just (c, r) -> go (acc <> T.singleton c) cmds r
+
+    -- Check if command is a, i, or c without inline text
+    isBlockTextCmd cmd =
+      let stripped = T.strip cmd
+      in case T.uncons stripped of
+           Just (c, rest) | c `elem` ("aic" :: String) ->
+             T.null rest || T.all (`elem` ("pnl" :: String)) rest
+           _ -> False
+
+    -- Check if remaining text contains a "." line (block terminator)
+    hasBlockTerminator t =
+      let lns = T.lines t
+      in "." `elem` lns
+
+    -- Read block text until "." line, then finish (no more commands after block)
+    goBlockText acc cmds t =
+      let (line, rest) = T.breakOn "\n" t
+      in if line == "."
+           then reverse ((acc <> ".") : cmds)  -- Done - block text ends the command list
+           else if T.null rest
+                then reverse ((acc <> line) : cmds)
+                else goBlockText (acc <> line <> "\n") cmds (T.drop 1 rest)

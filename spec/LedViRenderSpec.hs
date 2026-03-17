@@ -4,8 +4,9 @@ import Test.Hspec
 import qualified Data.Text as T
 import qualified Data.Vector as V
 
-import LedViState (DisplayZone(..), DisplayLine(..), LineStyle(..), emptyDisplayZone)
-import LedViRender (wrapDisplayZone, gutterWidth)
+import LedVi.Types (DisplayZone(..), DisplayLine(..), LineStyle(..), emptyDisplayZone)
+import LedVi.Render (wrapDisplayZone, gutterWidth)
+-- Note: tests use modules from LedVi.* hierarchy
 
 
 -- Helper to create a simple display line

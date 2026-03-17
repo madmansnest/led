@@ -2,7 +2,6 @@ module LedSession
   ( undoCommand, redoCommand
   , defineFunctionCommand, warnSuffixShadowing
   , importDirCommand
-  , markLine, adjustMarksInsert, adjustMarksDelete, clearMarks
   , printLastError, printHelpIfActive, toggleHelpMode
   , countUnmatchedBraces, findMatchingBrace
   , isFnDefinition, needsSubContinuation
@@ -17,7 +16,7 @@ import System.Directory (getCurrentDirectory)
 
 import LedParse (Command(..), isValidFunctionName, systemCommandNames)
 import LedCore (LedState(..))
-import LedNexus (BufferChangeFlag(..), adjustMarksForInsert, adjustMarksForDelete)
+import LedNexus (BufferChangeFlag(..))
 import qualified LedUndo
 import LedInput (Led, outputLine)
 import LedState
@@ -73,7 +72,8 @@ warnSuffixShadowing name = do
   when (lastChar == 'p' || lastChar == 'n' || lastChar == 'l') $ do
     let shorter = T.init name
     fns <- gets ledDefinedFunctions
-    let shadowsSysCmd = shorter `Set.member` systemCommandNames
+    -- Only single-char system commands support p/n/l suffixes
+    let shadowsSysCmd = shorter `Set.member` systemCommandNames && T.length shorter == 1
         shadowsUserFn = Map.member shorter fns && isValidFunctionName shorter
     when (shadowsSysCmd || shadowsUserFn) $ do
       let target = if shadowsSysCmd
@@ -89,18 +89,6 @@ importDirCommand = do
     case stack of
       (d:_) -> outputLine d
       []    -> liftIO getCurrentDirectory >>= outputLine
-
-markLine :: Char -> Int -> Led ()
-markLine c addr = modifyMarks (Map.insert c addr)
-
-adjustMarksInsert :: Int -> Int -> Led ()
-adjustMarksInsert pos count = modifyMarks (adjustMarksForInsert pos count)
-
-adjustMarksDelete :: Int -> Int -> Led ()
-adjustMarksDelete start end = modifyMarks (adjustMarksForDelete start end)
-
-clearMarks :: Led ()
-clearMarks = modifyMarks (const Map.empty)
 
 printLastError :: Led ()
 printLastError = gets ledLastError >>= traverse_ (outputLine . toString)

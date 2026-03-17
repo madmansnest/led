@@ -12,8 +12,7 @@ import LedInput (Led, LedEnv(..), HupRef, withLedEnv, runLed, getInputLineLed, h
 import LedNexus (BufferChangeFlag(..), DocumentState(..), insertDocAfter, documentCount, getFilenameAt, getDocStateAt, setDlCurrentDoc, emptyDocumentList, emptyDocumentState)
 import LedOptions (Options(..))
 import LedReadWrite (editFile)
-import LedSession (printHelpIfActive)
-import LedState (ensureNonEmptyDocList, flagError, guardChanged, setErrorText)
+import LedState (ensureNonEmptyDocList, guardChanged, reportError)
 import LedUndo (newUndoManager)
 import LedVi (enterVisualMode, VisualModeResult(..))
 import qualified LedDocument
@@ -133,11 +132,8 @@ repl hupRef = do
   pure (not stop)
   where
     handleSigint = do
-      modify (\s -> s { ledInputQueue = [] })  -- Clear pending commands
-      setErrorText "Interrupt"
-      flagError
-      outputLine "?"
-      printHelpIfActive
+      modify (\s -> s { ledInputQueue = [] })
+      reportError "Interrupt"
     handleEof = do
       interactive <- gets ledIsInteractive
       if interactive then guardChanged >>= \ok -> pure (not ok)

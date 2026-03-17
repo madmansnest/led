@@ -26,7 +26,6 @@ import qualified LedDocument
 import LedIO (readDocument, writeBytes, runShellCommand, expandPath, humanisePath)
 import LedInput (Led, outputLine, outputStrLn')
 import LedState
-import LedSession (adjustMarksInsert, adjustMarksDelete, clearMarks)
 import LedPrint (printByteCount, IODirection(..))
 
 resolveShellExpansion :: Text -> Led (Maybe Text)

@@ -1,4 +1,4 @@
-module LedViLine
+module LedVi.Line
   ( InputState(..)
   , emptyInput
   , inputText
@@ -151,5 +151,3 @@ historyDown _currentInput hn =
           else case indexList (hnHistory hn) (curIdx - 1) of
                  Nothing -> Nothing
                  Just entry -> Just (inputFromText entry, hn { hnIndex = curIdx - 1 })
-
-

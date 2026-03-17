@@ -16,6 +16,8 @@ module LedGlobal
   , executeGlobalCommand
   , executeInteractiveGlobal
   , interactOnMarkedLines
+    -- * Matching (for preview)
+  , findMatchingLineNumbers
   ) where
 
 import Data.List (minimum)
@@ -31,7 +33,7 @@ import LedState (addressError, curAndTotal, getDocument, getMarks, setChangeFlag
 import LedEdit (substituteLine)
 import LedSmartReplace (isSmartReplaceEligible, isAllLower)
 import LedPrint (printRange, printSuffix)
-import LedSession (adjustMarksDelete)
+import LedState (adjustMarksDelete)
 import LedInput (Led, getLineFromQueueOrInput)
 import LedCore (LedState(..))
 import LedNexus (BufferChangeFlag(..))
@@ -106,6 +108,22 @@ executeGlobal handlers matchSense lineRange reText cmdlistFirstLine = do
                     Nothing ->
                       -- Fall back to per-line execution with pre-parsed commands
                       executeOnMarkedLinesParsed handlers parsedCmds marked
+
+-- | Find matching line numbers for global command preview.
+-- Pure function - does not execute any commands.
+-- Returns line numbers that match (or don't match if matchSense=False) the regex.
+findMatchingLineNumbers :: Bool -> Text -> Int -> Int -> LedDocument.Document -> Either Text [Int]
+findMatchingLineNumbers matchSense reText startLine endLine doc =
+  case RE.parseBRE reText of
+    Left err -> Left err
+    Right bre ->
+      let smartSearch = isAllLower reText
+          matchFn = if smartSearch then RE.matchesBREInsensitive else RE.matchesBRE
+          lns = LedDocument.getLines startLine endLine doc
+          marked = [ lineNum | (lineNum, line) <- zip [startLine..endLine] lns
+                   , matchFn bre line == matchSense ]
+      in Right marked
+
 
 -- | Pattern detected for batch optimization
 data BatchPattern
@@ -205,26 +223,95 @@ executeBatchSubstitute start end marked subRe subRepl flags suffix = do
           else go ls (lineNum + 1) (l : acc) lastCh changed
 
 -- | Read continuation lines for a global command list.
--- If the first line ends with \, read more lines until one doesn't.
+-- Handles:
+--   1. Backslash continuation: if line ends with \, read more lines
+--   2. Block text commands (a, i, c): read lines until "." terminator
 readGlobalCmdlist :: Text -> Led Text
-readGlobalCmdlist firstLine = go firstLine
+readGlobalCmdlist firstLine = do
+    -- First handle backslash continuation
+    withBackslash <- readBackslashContinuation firstLine
+    -- Then handle block text for a/i/c commands
+    readBlockTextIfNeeded withBackslash
   where
-    go acc
+    -- Read backslash continuation lines
+    readBackslashContinuation acc
       | T.null acc = pure acc
       | T.last acc == '\\' = do
           let stripped = T.init acc
           mline <- getLineFromQueueOrInput
           case mline of
             Nothing   -> pure stripped
-            Just line -> go (stripped <> "\n" <> toText line)
+            Just line -> readBackslashContinuation (stripped <> "\n" <> toText line)
       | otherwise = pure acc
+
+    -- Check if command list ends with a/i/c that needs block text
+    readBlockTextIfNeeded cmdList = do
+      let cmds = splitGlobalCmds cmdList
+      case viaNonEmpty last cmds of
+        Nothing -> pure cmdList
+        Just lastCmd ->
+          if needsBlockText lastCmd
+            then do
+              -- Read block text until "."
+              blockLines <- readBlockLines
+              if null blockLines
+                then pure cmdList
+                else pure (cmdList <> "\n" <> T.intercalate "\n" blockLines <> "\n.")
+            else pure cmdList
+
+    -- Check if a command needs block text input
+    -- Commands: a, i, c (possibly followed by suffix p, n, l)
+    needsBlockText cmd =
+      let stripped = T.strip cmd
+          -- Check if it's just a/i/c possibly with suffix, no inline text
+      in case T.uncons stripped of
+           Just (c, rest) | c `elem` ("aic" :: String) ->
+             -- Only needs block if no text after command (just optional suffix)
+             T.null rest || T.all (`elem` ("pnl" :: String)) rest
+           _ -> False
+
+    -- Read lines until "." terminator
+    readBlockLines = go []
+      where
+        go acc = getLineFromQueueOrInput >>= \case
+          Nothing -> pure (reverse acc)
+          Just line
+            | line == "." -> pure (reverse acc)
+            | otherwise -> go (toText line : acc)
+
+-- | Check if a command modifies line count (add/delete lines).
+-- These commands need reverse execution order in global commands.
+commandModifiesLineCount :: Command -> Bool
+commandModifiesLineCount = \case
+  Append{} -> True
+  Change{} -> True
+  Insert{} -> True
+  Delete{} -> True
+  Join{}   -> True
+  ReadFile{} -> True
+  ReadShell{} -> True
+  Undo{} -> True
+  Redo{} -> True
+  _ -> False
+
+-- | Check if any parsed command modifies line count.
+anyModifiesLineCount :: [ParseResult] -> Bool
+anyModifiesLineCount = any $ \case
+  Complete cmd -> commandModifiesLineCount cmd
+  _ -> False
 
 -- | Execute the command list on each marked line with pre-parsed commands.
 -- Commands are already parsed (optimization #1).
+-- Executes from last to first only when commands modify line count,
+-- to avoid line number shifting issues.
 executeOnMarkedLinesParsed :: GlobalHandlers -> [ParseResult] -> [Int] -> Led ()
 executeOnMarkedLinesParsed _ _ [] = pure ()
 executeOnMarkedLinesParsed handlers parsedCmds marks' = do
-    forM_ marks' $ \markLine' -> do
+    -- Only reverse when commands modify line count
+    let orderedMarks = if anyModifiesLineCount parsedCmds
+                         then reverse marks'
+                         else marks'
+    forM_ orderedMarks $ \markLine' -> do
       doc <- getDocument
       let total = LedDocument.lineCount doc
       when (markLine' >= 1 && markLine' <= total) $ do
@@ -234,12 +321,28 @@ executeOnMarkedLinesParsed handlers parsedCmds marks' = do
           Incomplete -> addressError "Incomplete command"
           Complete cmd -> void $ executeGlobalCommand handlers cmd
 
+-- | Check if command text likely modifies line count.
+-- Conservative check for raw command text before expansion.
+cmdTextModifiesLineCount :: Text -> Bool
+cmdTextModifiesLineCount t =
+  let stripped = T.dropWhile (\c -> c == ',' || c == ';' || c == '.' || c == '$' ||
+                                    c == '+' || c == '-' || c == '\'' ||
+                                    c >= '0' && c <= '9') t
+  in case T.uncons stripped of
+       Just (c, _) -> c `elem` ("aicdj" :: String)
+       _ -> False
+
 -- | Execute the command list on each marked line, expanding expressions fresh each time.
 -- Used when commands contain {expr} that should be re-evaluated for each line.
+-- Executes from last to first only when commands modify line count.
 executeOnMarkedLinesWithExpansion :: GlobalHandlers -> [Text] -> [Int] -> Led ()
 executeOnMarkedLinesWithExpansion _ _ [] = pure ()
 executeOnMarkedLinesWithExpansion handlers cmds marks' = do
-    forM_ marks' $ \markLine' -> do
+    -- Only reverse when commands modify line count
+    let orderedMarks = if any cmdTextModifiesLineCount cmds
+                         then reverse marks'
+                         else marks'
+    forM_ orderedMarks $ \markLine' -> do
       doc <- getDocument
       let total = LedDocument.lineCount doc
       when (markLine' >= 1 && markLine' <= total) $ do

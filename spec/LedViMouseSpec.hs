@@ -2,7 +2,7 @@ module LedViMouseSpec (spec) where
 
 import Test.Hspec
 
-import LedViMouse
+import LedVi.Mouse
 
 
 spec :: Spec

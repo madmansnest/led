@@ -1,30 +1,20 @@
--- | Input/Output abstractions for led.
--- This module provides the Led monad and basic input/output functions.
--- Uses haskeline with vi mode for interactive input, simple stdin for non-interactive.
 module LedInput
-  ( -- * Core types
-    Led
+  ( Led
   , LedEnv(..)
   , EditMode(..)
   , HupRef
-    -- * Running Led
   , withLedEnv
   , runLed
-    -- * Input functions
   , getLineFromQueueOrInput
   , getInputLineRaw
   , getInputLineLed
   , readInputText
-    -- * Output functions
   , outputLine
   , outputStrLn'
-    -- * Interrupt handling
   , withInterrupt
   , handleInterrupt
-    -- * Settings
   , ledSettings
   , ledCompletion
-    -- * Completion for visual mode
   , runCompletion
   , Completion(..)
   ) where
@@ -42,16 +32,9 @@ import System.Console.Haskeline.Completion (Completion(..))
 
 import LedCore (LedState(..))
 
-
--- ---------------------------------------------------------------------------
--- Core types
--- ---------------------------------------------------------------------------
-
--- | Edit mode preference (read from ~/.haskeline).
 data EditMode = EditVi | EditEmacs
   deriving stock (Eq, Show)
 
--- | Environment for Led operations.
 data LedEnv = LedEnv
   { leInteractive :: !Bool
     -- ^ Whether we're in interactive mode
@@ -65,18 +48,10 @@ data LedEnv = LedEnv
     -- ^ Edit mode preference (Vi or Emacs) for visual mode keybindings
   }
 
--- | The Led monad: ReaderT over StateT over IO.
 type Led = ReaderT LedEnv (StateT LedState IO)
 
--- | Reference to the SIGHUP handler action.
 type HupRef = IORef (IO ())
 
-
--- ---------------------------------------------------------------------------
--- Running Led
--- ---------------------------------------------------------------------------
-
--- | Create a Led environment and run an action.
 -- Uses haskeline with vi mode for interactive input, simple stdin for non-interactive.
 withLedEnv :: Bool -> Maybe FilePath -> (LedEnv -> IO a) -> IO a
 withLedEnv interactive histFile action = do
@@ -105,8 +80,6 @@ withLedEnv interactive histFile action = do
             }
       action env
 
-
--- | Read edit mode preference from ~/.haskeline.
 -- Returns EditVi if "editMode: Vi" is found, EditEmacs otherwise (default).
 readEditModePreference :: IO EditMode
 readEditModePreference = do
@@ -132,27 +105,8 @@ readEditModePreference = do
                else EditEmacs
         [] -> EditEmacs
 
-
--- | Run a Led computation.
 runLed :: LedEnv -> LedState -> Led a -> IO (a, LedState)
 runLed env st action = runStateT (runReaderT action env) st
-
-
--- ---------------------------------------------------------------------------
--- Haskeline helpers
--- ---------------------------------------------------------------------------
-
--- | Run a haskeline input action.
--- Vi mode can be configured via ~/.haskeline with "editMode: Vi"
-runHaskelineInput :: H.Settings IO -> H.InputT IO a -> IO a
-runHaskelineInput = H.runInputT
-
-
--- ---------------------------------------------------------------------------
--- Input functions
--- ---------------------------------------------------------------------------
-
--- | Get a line of input, checking the queue first.
 -- Uses haskeline for interactive input, visual hook for visual mode, stdin for non-interactive.
 getLineFromQueueOrInput :: Led (Maybe String)
 getLineFromQueueOrInput = do
@@ -166,16 +120,13 @@ getLineFromQueueOrInput = do
       case leVisualInput env of
         Just getLine' -> liftIO getLine'  -- Visual mode: use hook
         Nothing -> case leHaskelineSettings env of
-          Just settings -> liftIO $ runHaskelineInput settings (H.getInputLine "")
+          Just settings -> liftIO $ H.runInputT settings (H.getInputLine "")
           Nothing -> liftIO getLineStdin   -- Non-interactive mode: use stdin
 
-
--- | Read a line from the input queue if available, otherwise from haskeline.
 -- Used by readInputText for multiline input modes.
 getInputLineRaw :: Led (Maybe String)
 getInputLineRaw = getLineFromQueueOrInput
 
--- | Get a line from stdin.
 getLineStdin :: IO (Maybe String)
 getLineStdin = do
   eof <- isEOF
@@ -183,7 +134,6 @@ getLineStdin = do
     then pure Nothing
     else Just . toString <$> getLine
 
--- | Read lines of input text until a line containing only "." is entered.
 readInputText :: Led [Text]
 readInputText = go []
   where
@@ -194,7 +144,6 @@ readInputText = go []
         | otherwise   -> go (toText line : acc)
 
 
--- | Get a line of input with a prompt.
 -- Uses haskeline for interactive input, visual hook for visual mode, stdin for non-interactive.
 getInputLineLed :: String -> Led (Maybe String)
 getInputLineLed prompt = do
@@ -208,50 +157,28 @@ getInputLineLed prompt = do
       case leVisualInput env of
         Just getLine' -> liftIO getLine'  -- Visual mode: use hook
         Nothing -> case leHaskelineSettings env of
-          Just settings -> liftIO $ runHaskelineInput settings (H.getInputLine prompt)
+          Just settings -> liftIO $ H.runInputT settings (H.getInputLine prompt)
           Nothing -> liftIO $ do          -- Non-interactive mode: prompt and read
             putStr prompt
             hFlush stdout
             getLineStdin
 
-
--- ---------------------------------------------------------------------------
--- Output functions
--- ---------------------------------------------------------------------------
-
--- | Output a line, either to stdout or to capture buffer.
 outputLine :: String -> Led ()
 outputLine s = gets ledCaptureOutput >>= \case
   Nothing -> liftIO $ putStrLn s
   Just acc ->
     modify (\st -> st { ledCaptureOutput = Just (toText s : acc) })
 
-
--- | Direct output (lifted).
 outputStrLn' :: String -> Led ()
 outputStrLn' = liftIO . putStrLn
 
-
--- ---------------------------------------------------------------------------
--- Interrupt handling
--- ---------------------------------------------------------------------------
-
--- | Handle interrupts during an action.
 -- Haskeline handles Ctrl-C via key events, so this is mostly a no-op wrapper.
 withInterrupt :: Led a -> Led a
 withInterrupt = id
 
-
--- | Handle interrupt with recovery.
 handleInterrupt :: Led a -> Led a -> Led a
 handleInterrupt _handler action = action
 
-
--- ---------------------------------------------------------------------------
--- Settings
--- ---------------------------------------------------------------------------
-
--- | Haskeline settings for led.
 ledSettings :: Maybe FilePath -> H.Settings IO
 ledSettings histFile = H.Settings
   { H.complete       = ledCompletion
@@ -259,8 +186,6 @@ ledSettings histFile = H.Settings
   , H.autoAddHistory = True
   }
 
-
--- | Custom completion function for led.
 -- Supports:
 -- 1. Filename completion for file commands (e, E, f, r, w, etc.)
 -- 2. Shell command completion after !
@@ -284,7 +209,6 @@ ledCompletion input@(left, _) =
        CompleteNone ->
          HC.noCompletion input
 
--- | Types of completion detected
 data CompletionType'
   = CompleteBraceExpr String String  -- ^ Prefix before {, content inside braces
   | CompleteRegexPrev String String  -- ^ Prefix before last /, previous pattern to substitute
@@ -292,7 +216,6 @@ data CompletionType'
   | CompleteFilename                 -- ^ Complete filename
   | CompleteNone                     -- ^ No completion
 
--- | Detect what type of completion is needed based on input.
 detectCompletionType :: String -> CompletionType'
 detectCompletionType line
   -- Check for {} expression: cursor immediately after }
@@ -305,7 +228,6 @@ detectCompletionType line
   | isFileCommand line = CompleteFilename
   | otherwise = CompleteNone
 
--- | Extract {} expression if cursor is immediately after }.
 -- Returns (prefix before {, content inside braces) if found.
 extractBraceExpr :: String -> Maybe (String, String)
 extractBraceExpr line = case line of
@@ -319,7 +241,6 @@ extractBraceExpr line = case line of
     findMatchingBrace ('}':rest) n acc = findMatchingBrace rest (n + 1) ('}':acc)
     findMatchingBrace (c:rest) n acc = findMatchingBrace rest n (c:acc)
 
--- | Extract previous regex pattern for substitution.
 -- When after /, if text after last / starts with (or is empty and matches)
 -- text after second-last /, substitute the second-last pattern.
 extractRegexPrev :: String -> Maybe (String, String)
@@ -340,7 +261,6 @@ extractRegexPrev line = do
       Just (prefix, betweenSlashes)
     _ -> Nothing
 
--- | Find positions of unescaped / characters (0-indexed from start of reversed string).
 findUnescapedSlashes :: String -> [Int]
 findUnescapedSlashes = go 0 False
   where
@@ -353,7 +273,6 @@ findUnescapedSlashes = go 0 False
       | c == '\\' = go (pos + 1) True cs
       | otherwise = go (pos + 1) False cs
 
--- | Check if we're completing a shell command (after !).
 isShellCommand :: String -> Bool
 isShellCommand line =
   let stripped = dropWhile isSpace line
@@ -366,7 +285,6 @@ isShellCommand line =
        ('w':'!':_) -> True  -- write to command
        _ -> False
 
--- | Check if we need filename completion.
 isFileCommand :: String -> Bool
 isFileCommand line =
   let stripped = dropWhile isSpace line
@@ -389,7 +307,6 @@ isFileCommand line =
     startsWithSpace [] = False
     startsWithSpace (c:_) = isSpace c
 
--- | Complete shell commands by looking up executables in PATH.
 completeShellCommand :: HC.CompletionFunc IO
 completeShellCommand input@(left, _) = do
   let line = reverse left
@@ -407,7 +324,6 @@ completeShellCommand input@(left, _) = do
           let hcCompletions = map (\c -> HC.Completion c c False) completions
           pure (reverse prefix, hcCompletions)
 
--- | Extract the word being completed from a shell command line.
 -- Returns (prefix to keep, word to complete).
 extractShellWord :: String -> (String, String)
 extractShellWord line =
@@ -428,7 +344,6 @@ extractShellWord line =
                  then (drop (length spaces + length word) line, "")
                  else (drop (length word2) line, word2)
 
--- | Get shell command completions from PATH.
 getShellCompletions :: String -> IO [String]
 getShellCompletions prefix = do
   pathEnv <- lookupEnv "PATH"
@@ -439,7 +354,6 @@ getShellCompletions prefix = do
       executables <- concat <$> mapM (getExecutablesInDir prefix) dirs
       pure $ take 50 executables  -- Limit results
 
--- | Get executables in a directory that match a prefix.
 getExecutablesInDir :: String -> FilePath -> IO [String]
 getExecutablesInDir prefix dir = do
   result <- try $ listDirectory dir :: IO (Either SomeException [FilePath])
@@ -449,7 +363,6 @@ getExecutablesInDir prefix dir = do
       let matching = filter (prefix `isPrefixOf`) entries
       filterM (isExecutableFile dir) matching
 
--- | Check if a file is executable.
 isExecutableFile :: FilePath -> FilePath -> IO Bool
 isExecutableFile dir name = do
   let fullPath = dir </> name
@@ -460,12 +373,6 @@ isExecutableFile dir name = do
       pure $ executable perms
     else pure False
 
-
--- ---------------------------------------------------------------------------
--- Completion for visual mode
--- ---------------------------------------------------------------------------
-
--- | Run completion for visual mode.
 -- Takes (text before cursor, text after cursor) and returns completions.
 -- Note: text before cursor is in NORMAL order (not reversed like haskeline).
 runCompletion :: (Text, Text) -> IO (Text, [Completion])

@@ -1,4 +1,4 @@
-module LedViParse
+module LedVi.Parse
   ( -- * Partial Parse Types
     PartialParse(..)
   , isParseError

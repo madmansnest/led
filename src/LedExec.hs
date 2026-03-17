@@ -4,7 +4,7 @@ module LedExec
   , expandExpressions, expandExpressionsRaw, findGlobalCmdlist
   , evaluateExpression, evaluatePrompt
   , invokeFunctionWithParams, executeFunctionBody
-  , processFunctionQueue, processFunctionQueueDirect, processFunctionQueueWith
+  , processFunctionQueue, processFunctionQueueDirect
   , executeCommand
   , getCurrentLineDefault, getLineCountDefault, getCurrentLineRange, getCurrentAndNextRange
   , handleLineCommand, handleParamCommand
@@ -36,6 +36,7 @@ import LedEdit
 import LedPrint
 import LedReadWrite
 import LedSession
+import LedQueue
 
 processInput :: Text -> Led Bool
 processInput input = do
@@ -66,13 +67,21 @@ processInputParsed input = do
           Nothing -> executeCommand cmd
           Just (FullRange docRange lineRange) -> do
             mDocRange <- substitutePrevDocRange docRange
-            mLineRange <- substitutePrevLineRange lineRange
+            -- For Repeat with LinePrevious, don't substitute - let executeCommand handle it
+            let skipSubst = case cmd of
+                  Repeat _ -> lineRange == LinePrevious
+                  _ -> False
+            mLineRange <- if skipSubst then pure (Just lineRange) else substitutePrevLineRange lineRange
             case (mDocRange, mLineRange) of
               (Nothing, _) -> addressError "No previous document range" *> pure True
               (_, Nothing) -> addressError "No previous line range" *> pure True
               (Just docR, Just lineR) -> do
-                savePrevRanges docR lineR
+                unless skipSubst $ savePrevRanges docR lineR
                 let cmd' = setCommandRange (FullRange docR lineR) cmd
+                -- Save command for 're' (but not 're' itself)
+                case cmd' of
+                  Repeat {} -> pure ()
+                  _ -> saveLastCommand cmd'
                 dispatchCommand docR lineR cmd'
 
     dispatchCommand docR lineR cmd = case docR of
@@ -83,7 +92,7 @@ processInputParsed input = do
       DocParam -> handleParamCommand lineR cmd
       _ -> handleCrossDocCommand docR lineR cmd
 
-    isEmptyPrint (PrintLines (FullRange DocDefault LineDefault) PrintSuffix) = T.null (T.strip input)
+    isEmptyPrint (SetLine (FullRange DocDefault LineDefault) _) = T.null (T.strip input)
     isEmptyPrint _ = False
 
     defaultNextLine = LineSingle (AddrOffset Current 1)
@@ -227,13 +236,9 @@ evaluateExpression expr = do
   oldCmdError <- gets ledCommandError
   modify (\s -> s { ledCaptureOutput = Just [], ledCommandError = False })
   let lns = T.splitOn "\n" (T.strip expr)
-  savedQueue <- gets ledInputQueue
-  wasVisual <- gets ledVisualMode
-  modify (\s -> s { ledInputQueue = lns })
-  void processFunctionQueueDirect
-  nowVisual <- gets ledVisualMode
-  -- Preserve queue if visual mode changed (remaining commands for new mode)
-  modify (\s -> s { ledInputQueue = if wasVisual == nowVisual then savedQueue else ledInputQueue s })
+  void $ saveAndRestoreQueue $ do
+    setQueue lns
+    processFunctionQueueDirect
   captured <- gets ledCaptureOutput
   hadError <- gets ledCommandError
   modify (\s -> s { ledCaptureOutput = oldCapture, ledCommandError = oldCmdError })
@@ -273,8 +278,7 @@ invokeFunctionWithParams name body args = do
 
 executeFunctionBody :: Text -> Led Bool
 executeFunctionBody body = do
-  let lns = T.splitOn "\n" body
-  modify (\s -> s { ledInputQueue = lns ++ ledInputQueue s })
+  prependToQueue (T.splitOn "\n" body)
   processFunctionQueue
 
 processFunctionQueue :: Led Bool
@@ -285,21 +289,18 @@ processFunctionQueueDirect = processFunctionQueueWith processInputDirect
 
 processFunctionQueueWith :: (Text -> Led Bool) -> Led Bool
 processFunctionQueueWith processor = do
-  queue <- gets ledInputQueue
-  case queue of
-    [] -> pure True
-    (x:xs) -> do
-      modify (\s -> s { ledInputQueue = xs })
+  mx <- popQueue
+  case mx of
+    Nothing -> pure True
+    Just x -> do
       wasVisual <- gets ledVisualMode
       fullLine <- readBlockContinuation x >>= readSubContinuation >>= readBackslashContinuation
       shouldContinue <- processor fullLine
       if shouldContinue
         then processFunctionQueueWith processor
         else do
-          -- If visual mode changed, preserve queue for the new mode to process.
-          -- Otherwise (quit command), clear the queue.
           nowVisual <- gets ledVisualMode
-          when (wasVisual == nowVisual) $ modify (\s -> s { ledInputQueue = [] })
+          when (wasVisual == nowVisual) clearQueue
           pure False
 
 -- | Execute a command and return whether to continue processing.
@@ -383,6 +384,12 @@ executeCommand = \case
       withLineAddressOr range getLineCountDefault False $ \addr -> outputLine (show addr)
       pure True
 
+    -- Bare address: set current line and print
+    SetLine range suffix -> do
+      let effectiveSuffix = if suffix == NoSuffix then PrintSuffix else suffix
+      withLineRange range $ \(s, e) -> printRange effectiveSuffix s e
+      pure True
+
     -- File I/O commands
     Write range path -> do
       doc <- getDocument
@@ -452,6 +459,38 @@ executeCommand = \case
             then pure False
             else printSuffix suf *> pure True
 
+    -- Repeat last command
+    Repeat range -> do
+      mLastCmd <- gets ledLastCommand
+      case mLastCmd of
+        Nothing -> addressError "No command to repeat" *> pure True
+        Just lastCmd -> do
+          let effectiveCmd = case frLines range of
+                LinePrevious -> lastCmd  -- %re: use original range exactly
+                LineDefault -> setCommandRange (FullRange (frDoc range) LineDefault) lastCmd
+                _ -> setCommandRange range lastCmd  -- use specified range
+          executeCommand effectiveCmd
+
+-- | Check if a command is repeatable (should be saved for 're')
+-- Only commands that modify the buffer or have meaningful effects
+isRepeatableCommand :: Command -> Bool
+isRepeatableCommand = \case
+  Append {} -> True; Change {} -> True; Insert {} -> True
+  Delete {} -> True; Join {} -> True; Substitute {} -> True
+  Move {} -> True; Transfer {} -> True
+  ShellFilter {} -> True
+  ReadFile {} -> True; ReadShell {} -> True
+  Global {} -> True; GlobalReverse {} -> True
+  GlobalInteractive {} -> True; GlobalReverseInteractive {} -> True
+  InvokeFunction {} -> True
+  _ -> False
+
+-- | Save command as last command if it's repeatable
+saveLastCommand :: Command -> Led ()
+saveLastCommand cmd =
+  when (isRepeatableCommand cmd) $
+    modify (\s -> s { ledLastCommand = Just cmd })
+
 formatLineRange :: LineRange -> Text
 formatLineRange = \case
   LineDefault -> ""
@@ -474,11 +513,7 @@ withLineRange range action = withLineRangeOr range getCurrentLineRange action
 
 withLineRangeOr :: FullRange -> Led (Int, Int) -> ((Int, Int) -> Led ()) -> Led ()
 withLineRangeOr (FullRange _ lineRange) defaultRange action = do
-  cur <- getCurrentLine
-  doc <- getDocument
-  let total = LedDocument.lineCount doc
-  marks <- getMarks
-  let docLines = LedDocument.documentLines doc
+  (cur, total, marks, docLines) <- getLineResolutionContext
   case lineRange of
     LineDefault -> defaultRange >>= action
     _ -> case resolveLineRange cur total marks docLines lineRange of
@@ -490,11 +525,7 @@ withLineAddress range allowZero action = withLineAddressOr range getCurrentLineD
 
 withLineAddressOr :: FullRange -> Led Int -> Bool -> (Int -> Led ()) -> Led ()
 withLineAddressOr (FullRange _ lineRange) defaultAddr allowZero action = do
-  cur <- getCurrentLine
-  doc <- getDocument
-  let total = LedDocument.lineCount doc
-  marks <- getMarks
-  let docLines = LedDocument.documentLines doc
+  (cur, total, marks, docLines) <- getLineResolutionContext
   case lineRange of
     LineDefault -> defaultAddr >>= action
     LineSingle addr -> case resolveAddr cur total marks docLines addr of
@@ -755,17 +786,9 @@ guardAllChanged = do
   case changed of
     [] -> pure True
     _ -> do
-      setErrorText ("Warning: "
-        <> pluraliseDocument changed
-        <> " "
-        <> (T.intercalate ", " $ map show changed)
-        <> " modified")
-      flagError
-      outputLine "?"
-      printHelpIfActive
+      let noun = if length changed == 1 then "document" else "documents"
+      reportWarning (noun <> " " <> T.intercalate ", " (map show changed) <> " modified")
       pure False
-  where
-    pluraliseDocument xs = if (length xs == 1) then "document" else "documents"
 
 importMacroCommand :: FilePath -> Led ()
 importMacroCommand path
@@ -784,19 +807,15 @@ importFromFile path = do
             scriptName = takeFileName absPath
             byteCount = B.length (TE.encodeUtf8 content)
         printByteCount byteCount ReadFrom (toText path)
-        savedQueue <- gets ledInputQueue
-        wasVisual <- gets ledVisualMode
-        modify (\s -> s { ledInputQueue = lns
-                        , ledImportDirStack = scriptDir : ledImportDirStack s
-                        , ledImportFileStack = scriptName : ledImportFileStack s
-                        , ledUndoDepth = ledUndoDepth s + 1 })
-        void processFunctionQueue
-        nowVisual <- gets ledVisualMode
-        modify (\s -> s { ledImportDirStack = drop 1 (ledImportDirStack s)
-                        , ledImportFileStack = drop 1 (ledImportFileStack s)
-                        -- Preserve queue if visual mode changed (remaining commands for new mode)
-                        , ledInputQueue = if wasVisual == nowVisual then savedQueue else ledInputQueue s
-                        , ledUndoDepth = ledUndoDepth s - 1 })
+        void $ saveAndRestoreQueue $ do
+          setQueue lns
+          modify (\s -> s { ledImportDirStack = scriptDir : ledImportDirStack s
+                          , ledImportFileStack = scriptName : ledImportFileStack s
+                          , ledUndoDepth = ledUndoDepth s + 1 })
+          void processFunctionQueue
+          modify (\s -> s { ledImportDirStack = drop 1 (ledImportDirStack s)
+                          , ledImportFileStack = drop 1 (ledImportFileStack s)
+                          , ledUndoDepth = ledUndoDepth s - 1 })
 
 importFromShell :: String -> Led ()
 importFromShell cmd = do
@@ -805,12 +824,9 @@ importFromShell cmd = do
         lns = if null out then [] else T.lines t
         byteCount = B.length (TE.encodeUtf8 t)
     printByteCount byteCount ReadFrom ("!" <> toText cmd)
-    savedQueue <- gets ledInputQueue
-    wasVisual <- gets ledVisualMode
-    modify (\s -> s { ledInputQueue = lns, ledUndoDepth = ledUndoDepth s + 1 })
-    void processFunctionQueue
-    nowVisual <- gets ledVisualMode
-    -- Preserve queue if visual mode changed (remaining commands for new mode)
-    modify (\s -> s { ledInputQueue = if wasVisual == nowVisual then savedQueue else ledInputQueue s
-                    , ledUndoDepth = ledUndoDepth s - 1 })
+    void $ saveAndRestoreQueue $ do
+      setQueue lns
+      modify (\s -> s { ledUndoDepth = ledUndoDepth s + 1 })
+      void processFunctionQueue
+      modify (\s -> s { ledUndoDepth = ledUndoDepth s - 1 })
     gets ledSilent >>= bool (outputStrLn' "!") (pure ())

@@ -13,48 +13,27 @@ import qualified Graphics.Vty as Vty
 import qualified Graphics.Vty.Platform.Unix as VtyUnix
 
 import LedCore (LedState(..), UndoManager(..))
-import LedInput (Led, LedEnv(..), runLed, runCompletion, Completion(..))
+import LedInput (Led, LedEnv(..), runLed)
 import LedDocument (documentLines, lineCount)
 import LedExec (processInput, readBlockContinuation, readSubContinuation, readBackslashContinuation)
+import LedGlobal (findMatchingLineNumbers)
 import LedState (ensureNonEmptyDocList)
-import LedNexus (BufferChangeFlag(..), DocumentList, DocumentState(..), dlCurrentDoc, documentCount, getDocStateAt, setDocStateAt)
+import LedNexus (BufferChangeFlag(..), DocumentState(..), dlCurrentDoc, documentCount, getDocStateAt, setDocStateAt)
 import LedParse (Command(..), FullRange(..), DocRange(..), LineRange(..))
+import LedResolve (resolveLineRange)
 import qualified LedUndo
-import LedViLine
-import LedViMouse
-import LedViParse (PartialParse(..), parsePartialWithFns, isParseError)
-import LedViRender (generateDisplayForParse, showDocumentList, showEmptyDisplay, wrapDisplayZone)
-import LedViState (DisplayZone(..), DisplayLine(..), LineStyle(..), HighlightStyle(..), ScrollDirection(..), applyScroll, canScroll, isRangeVisible, scrollToShowRange)
-
-
-data VisualModeResult
-  = VisualContinue    -- ^ Continue in normal REPL
-  | VisualQuit        -- ^ Quit editor
-  deriving stock (Eq, Show)
-
-data InputResult
-  = InputLine !Text      -- ^ Normal input line
-  | InputEOF             -- ^ EOF (Ctrl-D on empty)
-  | InputInterrupt       -- ^ Interrupt (Ctrl-C)
-  | InputExitVisual      -- ^ Exit visual mode (double ESC)
-  deriving stock (Eq, Show)
-
-data ResultDisplay
-  = ResultText ![Text]                      -- ^ Plain text output (p command, errors, etc.)
-  | ResultAffected ![LedUndo.AffectedRange] !Int  -- ^ Affected ranges, current doc index in range list
-  | ResultEmpty                             -- ^ Nothing to show (show current position)
-  | ResultInitial                           -- ^ Initial entry to visual mode (blank screen)
-  deriving stock (Eq, Show)
+import LedVi.Line
+import LedVi.Mouse
+import LedVi.Parse (PartialParse(..), parsePartialWithFns, isParseError)
+import LedVi.Types (VisualModeResult(..), InputResult(..), ResultDisplay(..), DisplayZone(..), DisplayLine(..), LineStyle(..), HighlightStyle(..), ScrollDirection(..), applyScroll, canScroll, isRangeVisible, isNearWindowEdge, ContinuationContext(..), ContinuationType(..), GlobalContInfo(..))
+import LedVi.Render (wrapDisplayZone, errorAttr, inputAttr)
+import LedVi.Preview (generateDisplayForParse, generateDisplayForParseAtView, windowedRenderThreshold, computeGlobalMatches, showGlobalCommandResultsWithMatches)
+import LedVi.Result (resultDisplayToZone, textLinesToDisplayZone, generateDisplayZoneForParse, getGlobalCommandInfo)
+import LedVi.Completion (CompletionResult(..), performCompletion)
 
 
 displayAttr :: Vty.Attr
 displayAttr = Vty.defAttr `Vty.withForeColor` Vty.white `Vty.withBackColor` Vty.black
-
-errorAttr :: Vty.Attr
-errorAttr = Vty.defAttr `Vty.withForeColor` Vty.red `Vty.withBackColor` Vty.black
-
-inputAttr :: Vty.Attr
-inputAttr = Vty.defAttr
 
 
 enterVisualMode :: LedEnv -> LedState -> IO (VisualModeResult, LedState)
@@ -172,11 +151,19 @@ getInputLine vty st inputRef histRef resultDisplay = do
   resultRef <- newIORef resultDisplay
   -- Create mouse state ref (for click-and-drag selection)
   mouseRef <- newIORef emptyMouseState
-  inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+  -- Create async preview ref (for non-blocking global search)
+  asyncRef <- newIORef (Nothing :: CachedGlobalMatches)
+  inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
-inputLoop :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> Bool -> IO InputResult
-inputLoop vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc = do
+-- Async state: (Maybe ongoing computation, Maybe cached results)
+-- | Cached global command matches: (pattern, docIdx, matches)
+-- Pattern is cached to avoid recomputing when only the command changes.
+type CachedGlobalMatches = Maybe (Text, Int, [Int])
+
+
+inputLoop :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> Bool -> IO InputResult
+inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef lastWasEsc = do
   input <- readIORef inputRef
   resultDisplay <- readIORef resultRef
   let inputTxt = inputText input
@@ -193,25 +180,79 @@ inputLoop vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc = do
   -- Get terminal dimensions for display generation
   (width, height) <- Vty.displayBounds (Vty.outputIface vty)
   let displayHeight = height - 1
+      dl = ledDocumentList st
+      docIdx = dlCurrentDoc dl
 
   -- Determine what to show in display zone:
   -- - If input is empty: show previous command result
   -- - If parse error: show previous command result (input line will be red)
   -- - Otherwise: show preview based on partial parse
   -- Then apply soft wrapping for long lines.
-  let baseDisplay = if T.null (T.strip inputTxt) || hasError
+  --
+  -- For windowed documents: if user has scrolled near buffer edge and input hasn't
+  -- changed, regenerate centered on current view position instead of target.
+  let isWindowed baseD = dzTotalLines baseD > windowedRenderThreshold && dzWindowStart baseD > 1
+
+      -- Check if we need to regenerate for scroll position
+      needsViewRegen baseD = not inputChanged
+                          && isWindowed baseD
+                          && isNearWindowEdge baseD { dzScrollTop = scrollOffset }
+
+      -- Compute logical view top line for regeneration
+      computeViewTop baseD = dzWindowStart baseD + scrollOffset
+
+  -- Handle global commands with match caching
+  -- Extract (invert, pattern, command, docRange, lineRange) if this is a global command with closed delimiter
+  let mGlobalInfo = getGlobalCommandInfo pp inputTxt
+
+  -- Manage cached matches and compute display
+  baseDisplay <- case mGlobalInfo of
+    Nothing -> do
+      -- Not a global command - clear cache and use sync path
+      writeIORef asyncRef Nothing
+      pure $ if T.null (T.strip inputTxt) || hasError
         then resultDisplayToZone resultDisplay st width displayHeight
         else generateDisplayZoneForParse pp st width displayHeight
+
+    Just (invert, pat, cmd, _docRange, _lineRange) -> do
+      -- Global command with closed delimiter
+      -- Check if we can reuse cached matches (same pattern and document)
+      cached <- readIORef asyncRef
+      matches <- case cached of
+        Just (cachedPat, cachedDocIdx, cachedMatches)
+          | cachedPat == pat && cachedDocIdx == docIdx ->
+            -- Pattern and doc unchanged, reuse cached matches
+            pure cachedMatches
+        _ -> do
+          -- Pattern or doc changed, recompute matches
+          newMatches <- computeGlobalMatches invert pat docIdx dl
+          writeIORef asyncRef (Just (pat, docIdx, newMatches))
+          pure newMatches
+
+      -- Display with command-specific styling (pass global pattern for s// case)
+      pure $ showGlobalCommandResultsWithMatches docIdx matches pat cmd dl width displayHeight
+
+  -- Check if we need to regenerate centered on view position
+  let finalBase = if needsViewRegen baseDisplay && not hasError && not (T.null (T.strip inputTxt))
+        then let viewTop = computeViewTop baseDisplay
+             in generateDisplayForParseAtView pp (ledDocumentList st) (ledParamStack st)
+                  (ledLastLineRange st) viewTop width displayHeight
+        else baseDisplay
+
       -- Wrap long lines for display and scrolling
-      wrappedBase = wrapDisplayZone baseDisplay
+      wrappedBase = wrapDisplayZone finalBase
 
   -- Apply scroll offset:
   -- - If scrollOffset = -1 (first iteration), check if target visible at 0, else use computed
   -- - If input changed and target range is NOT already visible, use preview's scroll
   -- - If input changed but target range IS already visible, keep current scroll
   -- - If input is the same, use the user's manual scroll position (for manual scrolling)
+  -- - If we regenerated for view, reset scroll to 0 (view is already centered)
   -- All indices are in visual (wrapped) line units.
-  let scrollOffset' = if scrollOffset < 0
+  let regenForView = needsViewRegen baseDisplay && not hasError && not (T.null (T.strip inputTxt))
+      scrollOffset' = if regenForView
+        then 0  -- View-centered regeneration, start at top of new window
+        else if scrollOffset < 0
         -- First iteration: determine initial scroll
         then case dzTargetRange wrappedBase of
           Nothing -> dzScrollTop wrappedBase
@@ -234,30 +275,30 @@ inputLoop vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc = do
 
   ev <- Vty.nextEvent vty
   case ev of
-    Vty.EvKey key mods -> handleKey vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc key mods dz
+    Vty.EvKey key mods -> handleKey vty st inputRef histRef scrollRef resultRef mouseRef asyncRef lastWasEsc key mods dz
     Vty.EvMouseDown _ _ Vty.BScrollUp _ -> do
       -- Mouse scroll up - check for document switch at boundary
-      handleScrollUp vty st inputRef histRef scrollRef resultRef mouseRef scrollOffset' inputTxt dz
+      handleScrollUp vty st inputRef histRef scrollRef resultRef mouseRef asyncRef scrollOffset' inputTxt dz
     Vty.EvMouseDown _ _ Vty.BScrollDown _ -> do
       -- Mouse scroll down - check for document switch at boundary
-      handleScrollDown vty st inputRef histRef scrollRef resultRef mouseRef scrollOffset' inputTxt dz
+      handleScrollDown vty st inputRef histRef scrollRef resultRef mouseRef asyncRef scrollOffset' inputTxt dz
     Vty.EvMouseDown _col row Vty.BLeft _ -> do
       -- Left mouse button pressed - start line selection
-      handleMouseDown vty st inputRef histRef scrollRef resultRef mouseRef row dz
+      handleMouseDown vty st inputRef histRef scrollRef resultRef mouseRef asyncRef row dz
     Vty.EvMouseUp _col row (Just Vty.BLeft) -> do
       -- Left mouse button released - complete line selection
-      handleMouseUp vty st inputRef histRef scrollRef resultRef mouseRef row dz
-    Vty.EvResize _ _ -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc
-    _ -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc
+      handleMouseUp vty st inputRef histRef scrollRef resultRef mouseRef asyncRef row dz
+    Vty.EvResize _ _ -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef lastWasEsc
+    _ -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef lastWasEsc
 
 
-handleScrollUp :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> Int -> Text -> DisplayZone -> IO InputResult
-handleScrollUp vty st inputRef histRef scrollRef resultRef mouseRef scrollOffset inputTxt _dz = do
+handleScrollUp :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> Int -> Text -> DisplayZone -> IO InputResult
+handleScrollUp vty st inputRef histRef scrollRef resultRef mouseRef asyncRef scrollOffset inputTxt _dz = do
   if scrollOffset > 0
     then do
       -- Normal scroll up
       writeIORef scrollRef (scrollOffset - 1, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
     else do
       -- At top - try to switch to previous document for multi-doc results
       resultDisplay <- readIORef resultRef
@@ -271,20 +312,20 @@ handleScrollUp vty st inputRef histRef scrollRef resultRef mouseRef scrollOffset
           let newDz = resultDisplayToZone (ResultAffected ranges newIdx) st width (height - 1)
               maxScroll = max 0 (V.length (dzLines newDz) - dzHeight newDz)
           writeIORef scrollRef (maxScroll, inputTxt)
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
         _ ->
           -- Can't scroll further
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
-handleScrollDown :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> Int -> Text -> DisplayZone -> IO InputResult
-handleScrollDown vty st inputRef histRef scrollRef resultRef mouseRef scrollOffset inputTxt dz = do
+handleScrollDown :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> Int -> Text -> DisplayZone -> IO InputResult
+handleScrollDown vty st inputRef histRef scrollRef resultRef mouseRef asyncRef scrollOffset inputTxt dz = do
   let maxScroll = max 0 (V.length (dzLines dz) - dzHeight dz)
   if scrollOffset < maxScroll
     then do
       -- Normal scroll down
       writeIORef scrollRef (scrollOffset + 1, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
     else do
       -- At bottom - try to switch to next document for multi-doc results
       resultDisplay <- readIORef resultRef
@@ -294,23 +335,23 @@ handleScrollDown vty st inputRef histRef scrollRef resultRef mouseRef scrollOffs
           let newIdx = idx + 1
           writeIORef resultRef (ResultAffected ranges newIdx)
           writeIORef scrollRef (0, inputTxt)  -- Start at top of new document
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
         _ ->
           -- Can't scroll further
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
 -- Updates input immediately so single-click works even without mouse-up.
 -- For drag: subsequent EvMouseDown events with BLeft update the range.
-handleMouseDown :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> Int -> DisplayZone -> IO InputResult
-handleMouseDown vty st inputRef histRef scrollRef resultRef mouseRef row dz = do
+handleMouseDown :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> Int -> DisplayZone -> IO InputResult
+handleMouseDown vty st inputRef histRef scrollRef resultRef mouseRef asyncRef row dz = do
   mouseState <- readIORef mouseRef
   let currentLineNum = getLineNumberAtRow row dz
 
   case currentLineNum of
     Nothing ->
       -- Clicked on non-line area (header, empty space) - ignore
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
     Just lineNum ->
       case msClickStart mouseState of
         Nothing -> do
@@ -318,16 +359,16 @@ handleMouseDown vty st inputRef histRef scrollRef resultRef mouseRef row dz = do
           writeIORef mouseRef (MouseState (Just lineNum))
           let rangeText = makeRangeText lineNum lineNum
           updateInputWithRange inputRef rangeText
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
         Just startLine -> do
           -- Continuing drag - update range from start to current
           let rangeText = makeRangeText startLine lineNum
           updateInputWithRange inputRef rangeText
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
-handleMouseUp :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> Int -> DisplayZone -> IO InputResult
-handleMouseUp vty st inputRef histRef scrollRef resultRef mouseRef row dz = do
+handleMouseUp :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> Int -> DisplayZone -> IO InputResult
+handleMouseUp vty st inputRef histRef scrollRef resultRef mouseRef asyncRef row dz = do
   mouseState <- readIORef mouseRef
   let endLineNum = getLineNumberAtRow row dz
 
@@ -339,156 +380,21 @@ handleMouseUp vty st inputRef histRef scrollRef resultRef mouseRef row dz = do
       -- Valid line selection - finalize range
       let rangeText = makeRangeText startLine endLine
       updateInputWithRange inputRef rangeText
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
     (Nothing, Just endLine) -> do
       -- No start recorded (mouse-up without prior mouse-down) - single line
       let rangeText = makeRangeText endLine endLine
       updateInputWithRange inputRef rangeText
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
     _ ->
       -- Released on non-line area - just clear state
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
-
-
-resultDisplayToZone :: ResultDisplay -> LedState -> Int -> Int -> DisplayZone
-resultDisplayToZone rd st width height = case rd of
-  ResultText lns -> textLinesToDisplayZone lns width height
-  ResultAffected ranges idx -> affectedRangeToZone ranges idx st width height
-  ResultEmpty -> showDocumentNoHighlight (ledDocumentList st) width height
-  ResultInitial -> showEmptyDisplay width height
-
-
--- Shows document without any highlighting, scrolled to current line.
--- Used for ResultEmpty (commands that don't change anything like empty append, undo).
-showDocumentNoHighlight :: DocumentList -> Int -> Int -> DisplayZone
-showDocumentNoHighlight dl width height =
-  let curDoc = dlCurrentDoc dl
-      mDocState = getDocStateAt curDoc dl
-  in case mDocState of
-    Nothing ->
-      -- No document, show doc list
-      showDocumentList dl width height
-    Just docState ->
-      let doc = docDocument docState
-          curLine = docCurrentLine docState
-          totalLines = lineCount doc
-          allLines = documentLines doc
-          -- All lines normal, no highlighting
-          displayLines = V.fromList
-            [ DisplayLine
-              { dlLineNum = Just (i + 1)
-              , dlSourceLine = Just (i + 1)
-              , dlDocIdx = curDoc
-              , dlText = indexText allLines i
-              , dlStyle = StyleNormal
-              , dlHighlights = []
-              }
-            | i <- [0 .. totalLines - 1]
-            ]
-          -- Scroll to show current line (where cursor is after undo)
-          targetLine = curLine - 1
-          scrollTop = scrollToShowRange targetLine targetLine totalLines height
-      in DisplayZone
-        { dzLines = displayLines
-        , dzScrollTop = scrollTop
-        , dzHeight = height
-        , dzWidth = width
-        , dzTargetRange = Just (targetLine, targetLine)
-        }
-
-
--- Shows the same view as during preview, but without selection highlighting
--- (deleted lines are already gone, added lines shown as normal).
-affectedRangeToZone :: [LedUndo.AffectedRange] -> Int -> LedState -> Int -> Int -> DisplayZone
-affectedRangeToZone ranges idx st width height
-  | null ranges = emptyDisplayZone width height
-  | idx < 0 || idx >= length ranges = emptyDisplayZone width height
-  | otherwise =
-      case drop idx ranges of
-        [] -> emptyDisplayZone width height
-        (LedUndo.AffectedRange docIdx rangeStart rangeEnd : _) ->
-          let dl = ledDocumentList st
-          in case getDocStateAt docIdx dl of
-            Nothing -> emptyDisplayZone width height
-            Just docState ->
-              let doc = docDocument docState
-                  totalLines = lineCount doc
-                  allLines = documentLines doc
-                  -- Create display lines for entire document - all StyleNormal
-                  -- (no highlighting of affected lines after command completion)
-                  displayLines = V.fromList
-                    [ DisplayLine
-                      { dlLineNum = Just i
-                      , dlSourceLine = Just i
-                      , dlDocIdx = docIdx
-                      , dlText = indexText allLines (i - 1)
-                      , dlStyle = StyleNormal
-                      , dlHighlights = []
-                      }
-                    | i <- [1 .. totalLines]
-                    ]
-                  -- Use minimal scroll to show affected range (0-based indices)
-                  targetStart = rangeStart - 1
-                  targetEnd = rangeEnd - 1
-                  scrollTop = scrollToShowRange targetStart targetEnd totalLines height
-              in DisplayZone
-                { dzLines = displayLines
-                , dzScrollTop = scrollTop
-                , dzHeight = height
-                , dzWidth = width
-                , dzTargetRange = Just (targetStart, targetEnd)  -- Set target for scroll preservation
-                }
-
-
-indexText :: [Text] -> Int -> Text
-indexText xs i
-  | i < 0 = ""
-  | otherwise = fromMaybe "" (viaNonEmpty head (drop i xs))
-
-
-emptyDisplayZone :: Int -> Int -> DisplayZone
-emptyDisplayZone width height = DisplayZone
-  { dzLines = V.empty
-  , dzScrollTop = 0
-  , dzHeight = height
-  , dzWidth = width
-  , dzTargetRange = Nothing
-  }
-
-
-generateDisplayZoneForParse :: PartialParse -> LedState -> Int -> Int -> DisplayZone
-generateDisplayZoneForParse pp st width height =
-  let dl = ledDocumentList st
-      paramStack = ledParamStack st
-  in generateDisplayForParse pp dl paramStack width height
-
-
-textLinesToDisplayZone :: [Text] -> Int -> Int -> DisplayZone
-textLinesToDisplayZone lns width height =
-  let displayLines = V.fromList
-        [ DisplayLine
-          { dlLineNum = Nothing
-          , dlSourceLine = Nothing  -- Command output has no source line
-          , dlDocIdx = 0
-          , dlText = line
-          , dlStyle = StyleNormal
-          , dlHighlights = []
-          }
-        | line <- lns
-        ]
-  in DisplayZone
-    { dzLines = displayLines
-    , dzScrollTop = 0
-    , dzHeight = height
-    , dzWidth = width
-    , dzTargetRange = Nothing  -- No specific target for text output
-    }
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
 
 
-handleKey :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> Bool -> Vty.Key -> [Vty.Modifier] -> DisplayZone -> IO InputResult
-handleKey vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc key mods dz = do
+handleKey :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> Bool -> Vty.Key -> [Vty.Modifier] -> DisplayZone -> IO InputResult
+handleKey vty st inputRef histRef scrollRef resultRef mouseRef asyncRef lastWasEsc key mods dz = do
   -- Clear mouse drag state on any key press
   writeIORef mouseRef emptyMouseState
   input <- readIORef inputRef
@@ -505,7 +411,7 @@ handleKey vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc key mo
         then return InputEOF
         else do
           writeIORef inputRef (deleteAt input)
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KChar 'c', [Vty.MCtrl]) ->
       -- Ctrl+C = interrupt, not clear
@@ -514,190 +420,141 @@ handleKey vty st inputRef histRef scrollRef resultRef mouseRef lastWasEsc key mo
     (Vty.KEsc, []) ->
       if lastWasEsc
         then return InputExitVisual  -- Double ESC = exit
-        else inputLoop vty st inputRef histRef scrollRef resultRef mouseRef True
+        else inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef True
 
     -- Scroll: PageUp = page up
     (Vty.KPageUp, []) -> do
       when (canScroll dz) $ do
         let scrolled = applyScroll ScrollPageUp dz
         writeIORef scrollRef (dzScrollTop scrolled, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Scroll: PageDown = page down
     (Vty.KPageDown, []) -> do
       when (canScroll dz) $ do
         let scrolled = applyScroll ScrollPageDown dz
         writeIORef scrollRef (dzScrollTop scrolled, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Scroll: Ctrl+B = page up (vi style)
     (Vty.KChar 'b', [Vty.MCtrl]) -> do
       when (canScroll dz) $ do
         let scrolled = applyScroll ScrollPageUp dz
         writeIORef scrollRef (dzScrollTop scrolled, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Scroll: Ctrl+F = page down (vi style)
     (Vty.KChar 'f', [Vty.MCtrl]) -> do
       when (canScroll dz) $ do
         let scrolled = applyScroll ScrollPageDown dz
         writeIORef scrollRef (dzScrollTop scrolled, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Scroll: Ctrl+Y = scroll up one line (vi style)
     (Vty.KChar 'y', [Vty.MCtrl]) -> do
       when (canScroll dz) $ do
         let scrolled = applyScroll ScrollLineUp dz
         writeIORef scrollRef (dzScrollTop scrolled, inputTxt)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Ctrl+E = move to end of line (emacs style)
     (Vty.KChar 'e', [Vty.MCtrl]) -> do
       writeIORef inputRef (moveEnd input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Ctrl+W = delete word before cursor (emacs style)
     (Vty.KChar 'w', [Vty.MCtrl]) -> do
       writeIORef inputRef (deleteWord input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KUp, []) -> do
       -- Navigate to older history entry
       hn <- readIORef histRef
       case historyUp input hn of
-        Nothing -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False  -- No more history
+        Nothing -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False  -- No more history
         Just (newInput, newHn) -> do
           writeIORef inputRef newInput
           writeIORef histRef newHn
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KDown, []) -> do
       -- Navigate to newer history entry
       hn <- readIORef histRef
       case historyDown input hn of
-        Nothing -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False  -- Already at newest
+        Nothing -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False  -- Already at newest
         Just (newInput, newHn) -> do
           writeIORef inputRef newInput
           writeIORef histRef newHn
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KBS, []) -> do
       writeIORef inputRef (deleteBack input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KDel, []) -> do
       writeIORef inputRef (deleteAt input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KLeft, []) -> do
       writeIORef inputRef (moveLeft input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KRight, []) -> do
       writeIORef inputRef (moveRight input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KHome, []) -> do
       writeIORef inputRef (moveHome input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KEnd, []) -> do
       writeIORef inputRef (moveEnd input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KChar 'a', [Vty.MCtrl]) -> do
       writeIORef inputRef (moveHome input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KChar 'k', [Vty.MCtrl]) -> do
       writeIORef inputRef (killToEnd input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KChar 'u', [Vty.MCtrl]) -> do
       writeIORef inputRef (killToStart input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     -- Tab completion
     (Vty.KChar '\t', []) -> do
-      handleCompletion vty st inputRef histRef scrollRef resultRef mouseRef
+      handleCompletion vty st inputRef histRef scrollRef resultRef mouseRef asyncRef
 
     (Vty.KChar c, []) -> do
       writeIORef inputRef (insertChar c input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
     (Vty.KChar c, [Vty.MShift]) -> do
       writeIORef inputRef (insertChar c input)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
-    _ -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
+    _ -> inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
-handleCompletion :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IO InputResult
-handleCompletion vty st inputRef histRef scrollRef resultRef mouseRef = do
+handleCompletion :: Vty.Vty -> LedState -> IORef InputState -> IORef HistoryNav -> IORef (Int, Text) -> IORef ResultDisplay -> IORef MouseState -> IORef CachedGlobalMatches -> IO InputResult
+handleCompletion vty st inputRef histRef scrollRef resultRef mouseRef asyncRef = do
   input <- readIORef inputRef
-  let InputState before after = input
-      -- Note: before is stored reversed, so reverse it for completion
-      beforeNormal = T.reverse before
-
-  -- Run completion
-  (remaining, completions) <- runCompletion (beforeNormal, after)
-
-  case completions of
-    [] ->
+  result <- performCompletion input
+  case result of
+    NoCompletions ->
       -- No completions - ring bell (visual feedback via re-render)
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
-
-    [c] -> do
-      -- Single completion - apply it
-      -- remaining is in normal order, we need to store reversed in InputState
-      let newBeforeNormal = remaining <> toText (replacement c)
-          newBefore = T.reverse newBeforeNormal
-          newInput = InputState newBefore after
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
+    SingleCompletion newInput -> do
       writeIORef inputRef newInput
-      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
-
-    (c:cs) -> do
-      -- Multiple completions - find common prefix and apply it
-      let allReplacements = map replacement (c:cs)
-          commonPfx = findCommonPrefix allReplacements
-      if null commonPfx
-        then do
-          -- No common prefix - show completions in display zone
-          let completionLines = map (toText . replacement) (c:cs)
-          writeIORef resultRef (ResultText completionLines)
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
-        else do
-          -- Apply common prefix
-          -- remaining is in normal order, we need to store reversed in InputState
-          let newBeforeNormal = remaining <> toText commonPfx
-              newBefore = T.reverse newBeforeNormal
-              newInput = InputState newBefore after
-          writeIORef inputRef newInput
-          inputLoop vty st inputRef histRef scrollRef resultRef mouseRef False
-  where
-    -- Find common prefix of a list of strings
-    findCommonPrefix :: [String] -> String
-    findCommonPrefix [] = []
-    findCommonPrefix [x] = x
-    findCommonPrefix (x:xs) = foldr commonPrefix' x xs
-
-    -- Find common prefix of two strings
-    commonPrefix' :: String -> String -> String
-    commonPrefix' [] _ = []
-    commonPrefix' _ [] = []
-    commonPrefix' (x:xs) (y:ys)
-      | x == y = x : commonPrefix' xs ys
-      | otherwise = []
-
-
-data ContinuationContext = ContinuationContext
-  { ccType :: !ContinuationType
-  , ccRange :: !(DocRange, LineRange)
-  , ccLines :: ![Text]  -- Lines accumulated so far (in reverse order)
-  } deriving stock (Eq, Show)
-
-data ContinuationType = ContAppend | ContInsert | ContChange | ContNone
-  deriving stock (Eq, Show)
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
+    MultipleWithPrefix newInput -> do
+      writeIORef inputRef newInput
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
+    MultipleNoPrefix completionLines -> do
+      writeIORef resultRef (ResultText completionLines)
+      inputLoop vty st inputRef histRef scrollRef resultRef mouseRef asyncRef False
 
 
 -- This reads from vty, showing a live preview of lines being added.
@@ -731,22 +588,37 @@ continuationLoop vty st inputRef ctxRef scrollRef = do
   -- Generate preview based on continuation context
   let -- Lines accumulated so far plus current input line
       allNewLines = reverse (ccLines ctx) ++ [currentInput]
-      dz = case ccType ctx of
-        ContAppend ->
-          let (docRange, lineRange) = ccRange ctx
-          in generateDisplayForParse (PPAppendText docRange lineRange allNewLines)
-               (ledDocumentList st) (ledParamStack st) width displayHeight
-        ContInsert ->
-          let (docRange, lineRange) = ccRange ctx
-          in generateDisplayForParse (PPInsertText docRange lineRange allNewLines)
-               (ledDocumentList st) (ledParamStack st) width displayHeight
-        ContChange ->
-          let (docRange, lineRange) = ccRange ctx
-          in generateDisplayForParse (PPChangeText docRange lineRange allNewLines)
-               (ledDocumentList st) (ledParamStack st) width displayHeight
-        ContNone ->
-          -- No context - show empty
-          textLinesToDisplayZone [] width displayHeight
+      mPrevLineRange = ledLastLineRange st
+      dl = ledDocumentList st
+      dz = case ccGlobalInfo ctx of
+        -- Global command: use global preview with matches
+        Just gci ->
+          let curDoc = dlCurrentDoc dl
+              matches = gciMatches gci
+              cmdChar = case ccType ctx of
+                ContAppend -> "a"
+                ContInsert -> "i"
+                ContChange -> "c"
+                ContNone -> ""
+              cmdText = cmdChar <> "\n" <> T.intercalate "\n" allNewLines
+          in showGlobalCommandResultsWithMatches curDoc matches (gciPattern gci) cmdText dl width displayHeight
+        -- Regular command: use normal preview
+        Nothing -> case ccType ctx of
+          ContAppend ->
+            let (docRange, lineRange) = ccRange ctx
+            in generateDisplayForParse (PPAppendText docRange lineRange allNewLines)
+                 dl (ledParamStack st) mPrevLineRange width displayHeight
+          ContInsert ->
+            let (docRange, lineRange) = ccRange ctx
+            in generateDisplayForParse (PPInsertText docRange lineRange allNewLines)
+                 dl (ledParamStack st) mPrevLineRange width displayHeight
+          ContChange ->
+            let (docRange, lineRange) = ccRange ctx
+            in generateDisplayForParse (PPChangeText docRange lineRange allNewLines)
+                 dl (ledParamStack st) mPrevLineRange width displayHeight
+          ContNone ->
+            -- No context - show empty
+            textLinesToDisplayZone [] width displayHeight
       wrappedDz = wrapDisplayZone dz
 
       -- Preserve scroll if target range is already visible
@@ -855,67 +727,96 @@ continuationLoop vty st inputRef ctxRef scrollRef = do
 handleContinuationCompletion :: Vty.Vty -> LedState -> IORef InputState -> IORef ContinuationContext -> IORef (Int, Text) -> IO (Maybe Text)
 handleContinuationCompletion vty st inputRef ctxRef scrollRef = do
   input <- readIORef inputRef
-  let InputState before after = input
-      beforeNormal = T.reverse before
-
-  -- Run completion
-  (remaining, completions) <- runCompletion (beforeNormal, after)
-
-  case completions of
-    [] ->
-      -- No completions - continue
+  result <- performCompletion input
+  case result of
+    NoCompletions ->
       continuationLoop vty st inputRef ctxRef scrollRef
-
-    [c] -> do
-      -- Single completion - apply it
-      -- remaining is in normal order, we need to store reversed in InputState
-      let newBeforeNormal = remaining <> toText (replacement c)
-          newBefore = T.reverse newBeforeNormal
-          newInput = InputState newBefore after
+    SingleCompletion newInput -> do
       writeIORef inputRef newInput
       continuationLoop vty st inputRef ctxRef scrollRef
-
-    (c:cs) -> do
-      -- Multiple completions - apply common prefix
-      let allReplacements = map replacement (c:cs)
-          commonPfx = findContCommonPrefix allReplacements
-      if null commonPfx
-        then
-          -- No common prefix - just continue (could show completions in future)
-          continuationLoop vty st inputRef ctxRef scrollRef
-        else do
-          -- Apply common prefix
-          -- remaining is in normal order, we need to store reversed in InputState
-          let newBeforeNormal = remaining <> toText commonPfx
-              newBefore = T.reverse newBeforeNormal
-              newInput = InputState newBefore after
-          writeIORef inputRef newInput
-          continuationLoop vty st inputRef ctxRef scrollRef
-  where
-    findContCommonPrefix :: [String] -> String
-    findContCommonPrefix [] = []
-    findContCommonPrefix [x] = x
-    findContCommonPrefix (x:xs) = foldr contCommonPrefix' x xs
-
-    contCommonPrefix' :: String -> String -> String
-    contCommonPrefix' [] _ = []
-    contCommonPrefix' _ [] = []
-    contCommonPrefix' (x:xs) (y:ys)
-      | x == y = x : contCommonPrefix' xs ys
-      | otherwise = []
+    MultipleWithPrefix newInput -> do
+      writeIORef inputRef newInput
+      continuationLoop vty st inputRef ctxRef scrollRef
+    MultipleNoPrefix _ ->
+      -- No common prefix - just continue (continuation mode doesn't show completion list)
+      continuationLoop vty st inputRef ctxRef scrollRef
 
 
-detectContinuationType :: Text -> LedState -> (ContinuationType, DocRange, LineRange)
+-- | Detect continuation type and global info from command text.
+-- Returns (contType, docRange, lineRange, globalInfo)
+detectContinuationType :: Text -> LedState -> (ContinuationType, DocRange, LineRange, Maybe GlobalContInfo)
 detectContinuationType cmdText st =
   let userFns = Set.fromList $ Map.keys (ledDefinedFunctions st)
   in case parsePartialWithFns userFns cmdText of
     PPCommand (Append (FullRange docRange lineRange) _ _) ->
-      (ContAppend, docRange, lineRange)
+      (ContAppend, docRange, lineRange, Nothing)
     PPCommand (Insert (FullRange docRange lineRange) _ _) ->
-      (ContInsert, docRange, lineRange)
+      (ContInsert, docRange, lineRange, Nothing)
     PPCommand (Change (FullRange docRange lineRange) _ _) ->
-      (ContChange, docRange, lineRange)
-    _ -> (ContNone, DocDefault, LineDefault)
+      (ContChange, docRange, lineRange, Nothing)
+    -- Global command with block text sub-command
+    PPCommand (Global (FullRange docRange lineRange) pat cmdlist) ->
+      detectGlobalBlockText False docRange lineRange pat cmdlist st
+    PPCommand (GlobalReverse (FullRange docRange lineRange) pat cmdlist) ->
+      detectGlobalBlockText True docRange lineRange pat cmdlist st
+    -- Also check partial global commands
+    PPGlobalCommand docRange lineRange _delim pat cmdlist ->
+      let invert = isInvertedGlobal cmdText
+      in detectGlobalBlockText invert docRange lineRange pat cmdlist st
+    _ -> (ContNone, DocDefault, LineDefault, Nothing)
+
+-- | Check if command text starts with v or V (inverted global)
+isInvertedGlobal :: Text -> Bool
+isInvertedGlobal t =
+  let stripped = T.dropWhile (\c -> c == ',' || c == ';' || c == '.' || c == '$' ||
+                                     c == '+' || c == '-' || c == '\'' || c == ':' ||
+                                     (c >= '0' && c <= '9')) t
+  in case T.uncons stripped of
+       Just (c, _) -> c == 'v' || c == 'V'
+       _ -> False
+
+-- | Detect if global command has block text sub-command (a/i/c)
+detectGlobalBlockText :: Bool -> DocRange -> LineRange -> Text -> Text -> LedState
+                      -> (ContinuationType, DocRange, LineRange, Maybe GlobalContInfo)
+detectGlobalBlockText invert docRange lineRange pat cmdlist st =
+  let subCmd = T.strip cmdlist
+  in case T.uncons subCmd of
+       Just ('a', rest) | isBlockTextCmd rest -> makeGlobalCont ContAppend
+       Just ('i', rest) | isBlockTextCmd rest -> makeGlobalCont ContInsert
+       Just ('c', rest) | isBlockTextCmd rest -> makeGlobalCont ContChange
+       _ -> (ContNone, DocDefault, LineDefault, Nothing)
+  where
+    -- Check that after command letter there's only optional suffix (p/n/l) or nothing
+    isBlockTextCmd rest = T.null rest || T.all (`elem` ("pnl" :: String)) rest
+
+    makeGlobalCont contType =
+      let matches = computeGlobalMatchesForCont invert pat docRange lineRange st
+          gci = GlobalContInfo { gciPattern = pat, gciMatches = matches, gciInvert = invert }
+      in (contType, docRange, lineRange, Just gci)
+
+-- | Compute matching line numbers for global command continuation preview
+computeGlobalMatchesForCont :: Bool -> Text -> DocRange -> LineRange -> LedState -> [Int]
+computeGlobalMatchesForCont invert pat docRange lineRange st =
+  let dl = ledDocumentList st
+      curDoc = dlCurrentDoc dl
+      matchSense = not invert  -- g/ matches True, v/ matches False
+  in case docRange of
+       DocDefault ->
+         case getDocStateAt curDoc dl of
+           Nothing -> []
+           Just docState ->
+             let doc = docDocument docState
+                 total = lineCount doc
+                 curLine = docCurrentLine docState
+                 (startLine, endLine) = case lineRange of
+                   LineDefault -> if total == 0 then (0, 0) else (1, total)
+                   _ -> case resolveLineRange curLine total (docMarks docState) (documentLines doc) lineRange of
+                     Left _ -> (1, total)
+                     Right (s, e) -> (s, e)
+             in case findMatchingLineNumbers matchSense pat startLine endLine doc of
+                  Left _ -> []
+                  Right matches -> matches
+       _ -> []  -- Multi-doc global commands not supported in continuation preview yet
 
 
 -- Returns (result display, new state, should quit).
@@ -927,13 +828,14 @@ processLine vty env inputRef st lineText = do
       wasVisual = ledVisualMode st
 
   -- Detect if this is a text input command (append/insert/change)
-  let (contType, docRange, lineRange) = detectContinuationType lineText st
+  let (contType, docRange, lineRange, mGlobalInfo) = detectContinuationType lineText st
 
   -- Create continuation context ref
   ctxRef <- newIORef ContinuationContext
     { ccType = contType
     , ccRange = (docRange, lineRange)
     , ccLines = []
+    , ccGlobalInfo = mGlobalInfo
     }
 
   -- Create scroll ref that persists across all lines of input
@@ -960,8 +862,9 @@ processLine vty env inputRef st lineText = do
 
     pure result
 
-  -- Get captured output
-  let capturedLines = reverse $ fromMaybe [] (ledCaptureOutput st2)
+  -- Get captured output (split any embedded newlines into separate lines)
+  let rawCaptured = reverse $ fromMaybe [] (ledCaptureOutput st2)
+      capturedLines = concatMap T.lines rawCaptured
       st3 = st2 { ledCaptureOutput = Nothing }
 
   -- Determine if this is a quit or mode change:

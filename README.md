@@ -20,6 +20,7 @@ It is supposed to mostly work like ed but adds a lot of bloat, namely:
 - File management
 - Dynamic prompt
 - Script loading
+- Repeat last range or command
 
 Disclaimer: This editor is my hobby project and as such an eternal work in progress. Use at your own risk.
 
@@ -108,6 +109,12 @@ Prompt can be set from inside the editor with `P` new_prompt command, and any ex
 `im script.led` reads the file script.led and runs each line as a command, allowing scripting. Startup scripts can be run by using `-e` switch on the command line (multiple scripts can be run this way).
 
 A script can run any commands including `im`, and there is a special `imd` command that prints the directory of the current script, allowing relative imports with expression substitution: `im {imd}/second.led`. At toplevel `imd` prints current directory.
+
+### Repeat last range or command
+
+`%` instead of a document range, or a line range, or both (`%:%`) can be used to repeat previous command with another range.
+
+Special command `re` can be used to repeat last command with the same arguments (on a different range, or on the same range with `%re`).
 
 ## Installation
 
